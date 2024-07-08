@@ -24,7 +24,7 @@ deno_ops = { version = "0.168.0", path = "./ops" }
 serde_v8 = { version = "0.201.0", path = "./serde_v8" }
 deno_core_testing = { path = "./testing" }
 
-v8 = { version = "0.96.0", default-features = false }
+v8 = { version = "0.95.0", default-features = false }
 deno_ast = { version = "=0.35.3", features = ["transpiling"] }
 deno_unsync = "0.3.2"
 deno_core_icudata = "0.0.73"
@@ -60,7 +60,7 @@ testing_macros = "0.2.11"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 twox-hash = "1.6.3"
-url = { version = "2", features = ["serde", "expose_internals"] }
+url = { version = "2.3.1", features = ["serde", "expose_internals"] }
 
 # macros
 proc-macro2 = "1"
