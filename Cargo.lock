@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "v8"
-version = "0.92"
+version = "0.92.0"
 source = "git+https://github.com/coasys/rusty_v8.git?branch=v0.92-dll#683815c504d23bf5205c320a31f3f7af5440a5b8"
 dependencies = [
  "bitflags",
