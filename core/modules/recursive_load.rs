@@ -1,17 +1,19 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
-use crate::module_specifier::ModuleSpecifier;
-use crate::modules::map::ModuleMap;
-use crate::modules::ModuleError;
-use crate::modules::ModuleId;
-use crate::modules::ModuleLoadId;
-use crate::modules::ModuleRequest;
-use crate::modules::RequestedModuleType;
-use crate::modules::ResolutionKind;
-use crate::resolve_url;
+// Copyright 2018-2025 the Deno authors. MIT license.
+
 use crate::ModuleLoadResponse;
 use crate::ModuleLoader;
 use crate::ModuleSource;
-use anyhow::Error;
+use crate::error::CoreError;
+use crate::module_specifier::ModuleSpecifier;
+use crate::modules::ModuleError;
+use crate::modules::ModuleId;
+use crate::modules::ModuleLoadId;
+use crate::modules::ModuleLoaderError;
+use crate::modules::ModuleRequest;
+use crate::modules::RequestedModuleType;
+use crate::modules::ResolutionKind;
+use crate::modules::map::ModuleMap;
+use crate::resolve_url;
 use futures::future::FutureExt;
 use futures::stream::FuturesUnordered;
 use futures::stream::Stream;
@@ -25,8 +27,9 @@ use std::rc::Rc;
 use std::task::Context;
 use std::task::Poll;
 
-type ModuleLoadFuture =
-  dyn Future<Output = Result<Option<(ModuleRequest, ModuleSource)>, Error>>;
+type ModuleLoadFuture = dyn Future<
+  Output = Result<Option<(ModuleRequest, ModuleSource)>, ModuleLoaderError>,
+>;
 
 /// Describes the entrypoint of a recursive module load.
 #[derive(Debug)]
@@ -61,6 +64,12 @@ pub(crate) struct RecursiveModuleLoad {
   // The loader is copied from `module_map_rc`, but its reference is cloned
   // ahead of time to avoid already-borrowed errors.
   loader: Rc<dyn ModuleLoader>,
+}
+
+impl Drop for RecursiveModuleLoad {
+  fn drop(&mut self) {
+    self.loader.finish_load();
+  }
 }
 
 impl RecursiveModuleLoad {
@@ -125,7 +134,7 @@ impl RecursiveModuleLoad {
     load
   }
 
-  fn resolve_root(&self) -> Result<ModuleSpecifier, Error> {
+  fn resolve_root(&self) -> Result<ModuleSpecifier, CoreError> {
     match self.init {
       LoadInit::Main(ref specifier) => {
         self
@@ -143,7 +152,7 @@ impl RecursiveModuleLoad {
     }
   }
 
-  pub(crate) async fn prepare(&self) -> Result<(), Error> {
+  pub(crate) async fn prepare(&self) -> Result<(), CoreError> {
     let (module_specifier, maybe_referrer) = match self.init {
       LoadInit::Main(ref specifier) => {
         let spec = self.module_map_rc.resolve(
@@ -174,6 +183,7 @@ impl RecursiveModuleLoad {
       .loader
       .prepare_load(&module_specifier, maybe_referrer, self.is_dynamic_import())
       .await
+      .map_err(|e| e.into())
   }
 
   fn is_currently_loading_main_module(&self) -> bool {
@@ -244,50 +254,53 @@ impl RecursiveModuleLoad {
             .borrow()
             .contains(module_request.specifier.as_str())
         {
-          if let Some(module_id) = self.module_map_rc.get_id(
+          match self.module_map_rc.get_id(
             module_request.specifier.as_str(),
             &module_request.requested_module_type,
           ) {
-            already_registered.push_back((module_id, module_request.clone()));
-          } else {
-            let request = module_request.clone();
-            let visited_as_alias = self.visited_as_alias.clone();
-            let referrer = referrer.clone();
-            let loader = self.loader.clone();
-            let is_dynamic_import = self.is_dynamic_import();
-            let requested_module_type = request.requested_module_type.clone();
-            let fut = async move {
-              // `visited_as_alias` unlike `visited` is checked as late as
-              // possible because it can only be populated after completed
-              // loads, meaning a duplicate load future may have already been
-              // dispatched before we know it's a duplicate.
-              if visited_as_alias
-                .borrow()
-                .contains(request.specifier.as_str())
-              {
-                return Ok(None);
-              }
-              let load_response = loader.load(
-                &request.specifier,
-                Some(&referrer),
-                is_dynamic_import,
-                requested_module_type,
-              );
-
-              let load_result = match load_response {
-                ModuleLoadResponse::Sync(result) => result,
-                ModuleLoadResponse::Async(fut) => fut.await,
-              };
-              if let Ok(source) = &load_result {
-                if let Some(found_specifier) = &source.module_url_found {
-                  visited_as_alias
-                    .borrow_mut()
-                    .insert(found_specifier.as_str().to_string());
+            Some(module_id) => {
+              already_registered.push_back((module_id, module_request.clone()));
+            }
+            _ => {
+              let request = module_request.clone();
+              let visited_as_alias = self.visited_as_alias.clone();
+              let referrer = referrer.clone();
+              let loader = self.loader.clone();
+              let is_dynamic_import = self.is_dynamic_import();
+              let requested_module_type = request.requested_module_type.clone();
+              let fut = async move {
+                // `visited_as_alias` unlike `visited` is checked as late as
+                // possible because it can only be populated after completed
+                // loads, meaning a duplicate load future may have already been
+                // dispatched before we know it's a duplicate.
+                if visited_as_alias
+                  .borrow()
+                  .contains(request.specifier.as_str())
+                {
+                  return Ok(None);
                 }
-              }
-              load_result.map(|s| Some((request, s)))
-            };
-            self.pending.push(fut.boxed_local());
+                let load_response = loader.load(
+                  &request.specifier,
+                  Some(&referrer),
+                  is_dynamic_import,
+                  requested_module_type,
+                );
+
+                let load_result = match load_response {
+                  ModuleLoadResponse::Sync(result) => result,
+                  ModuleLoadResponse::Async(fut) => fut.await,
+                };
+                if let Ok(source) = &load_result {
+                  if let Some(found_specifier) = &source.module_url_found {
+                    visited_as_alias
+                      .borrow_mut()
+                      .insert(found_specifier.as_str().to_string());
+                  }
+                }
+                load_result.map(|s| Some((request, s)))
+              };
+              self.pending.push(fut.boxed_local());
+            }
           }
           self.visited.insert(module_request);
         }
@@ -297,7 +310,7 @@ impl RecursiveModuleLoad {
 }
 
 impl Stream for RecursiveModuleLoad {
-  type Item = Result<(ModuleRequest, ModuleSource), Error>;
+  type Item = Result<(ModuleRequest, ModuleSource), CoreError>;
 
   fn poll_next(
     self: Pin<&mut Self>,
@@ -310,7 +323,9 @@ impl Stream for RecursiveModuleLoad {
       LoadState::Init => {
         let module_specifier = match inner.resolve_root() {
           Ok(url) => url,
-          Err(error) => return Poll::Ready(Some(Err(error))),
+          Err(error) => {
+            return Poll::Ready(Some(Err(error)));
+          }
         };
         let requested_module_type = match &inner.init {
           LoadInit::DynamicImport(_, _, module_type) => module_type.clone(),
@@ -361,14 +376,17 @@ impl Stream for RecursiveModuleLoad {
         inner.try_poll_next_unpin(cx)
       }
       LoadState::LoadingRoot | LoadState::LoadingImports => {
+        // Poll the futures that load the source code of the modules
         match inner.pending.try_poll_next_unpin(cx)? {
           Poll::Ready(None) => unreachable!(),
           Poll::Ready(Some(None)) => {
+            // The future resolves to None when loading an already visited redirect
             if inner.pending.is_empty() {
               inner.state = LoadState::Done;
               Poll::Ready(None)
             } else {
-              Poll::Pending
+              // Force re-poll to make sure new ModuleLoadFuture's wakers are registered
+              inner.try_poll_next_unpin(cx)
             }
           }
           Poll::Ready(Some(Some(info))) => Poll::Ready(Some(Ok(info))),

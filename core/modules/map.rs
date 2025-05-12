@@ -1,17 +1,19 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
-use super::module_map_data::ModuleMapSnapshotData;
+// Copyright 2018-2025 the Deno authors. MIT license.
+
 use super::IntoModuleCodeString;
 use super::IntoModuleName;
+use super::ModuleConcreteError;
+use super::module_map_data::ModuleMapSnapshotData;
+use crate::FastStaticString;
+use crate::JsRuntime;
+use crate::ModuleCodeBytes;
+use crate::ModuleLoadResponse;
+use crate::ModuleSource;
+use crate::ModuleSourceCode;
+use crate::ModuleSpecifier;
 use crate::ascii_str;
-use crate::error::exception_to_err_result;
-use crate::error::generic_error;
-use crate::error::throw_type_error;
-use crate::error::to_v8_type_error;
-use crate::error::AnyError;
 use crate::error::JsError;
-use crate::modules::get_requested_module_type_from_attributes;
-use crate::modules::parse_import_attributes;
-use crate::modules::recursive_load::RecursiveModuleLoad;
+use crate::error::exception_to_err_result;
 use crate::modules::ImportAttributesKind;
 use crate::modules::ModuleCodeString;
 use crate::modules::ModuleError;
@@ -22,28 +24,31 @@ use crate::modules::ModuleName;
 use crate::modules::ModuleRequest;
 use crate::modules::ModuleType;
 use crate::modules::ResolutionKind;
-use crate::runtime::exception_state::ExceptionState;
+use crate::modules::get_requested_module_type_from_attributes;
+use crate::modules::parse_import_attributes;
+use crate::modules::recursive_load::RecursiveModuleLoad;
 use crate::runtime::JsRealm;
 use crate::runtime::SnapshotLoadDataStore;
 use crate::runtime::SnapshotStoreDataStore;
-use crate::FastStaticString;
-use crate::JsRuntime;
-use crate::ModuleLoadResponse;
-use crate::ModuleSource;
-use crate::ModuleSpecifier;
-use anyhow::bail;
-use anyhow::Context as _;
-use anyhow::Error;
+use crate::runtime::exception_state::ExceptionState;
+use capacity_builder::StringBuilder;
+use deno_error::JsErrorBox;
+use futures::StreamExt;
 use futures::future::FutureExt;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamFuture;
-use futures::task::noop_waker_ref;
 use futures::task::AtomicWaker;
-use futures::Future;
-use futures::StreamExt;
+use indexmap::IndexMap;
+use std::future::Future;
 use v8::Function;
 use v8::PromiseState;
+use wasm_dep_analyzer::WasmDeps;
 
+use super::CustomModuleEvaluationKind;
+use super::LazyEsmModuleLoader;
+use super::RequestedModuleType;
+use super::module_map_data::ModuleMapData;
+use deno_core::error::CoreError;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -55,13 +60,8 @@ use std::task::Context;
 use std::task::Poll;
 use tokio::sync::oneshot;
 
-use super::module_map_data::ModuleMapData;
-use super::CustomModuleEvaluationKind;
-use super::LazyEsmModuleLoader;
-use super::RequestedModuleType;
-
 type PrepareLoadFuture =
-  dyn Future<Output = (ModuleLoadId, Result<RecursiveModuleLoad, Error>)>;
+  dyn Future<Output = (ModuleLoadId, Result<RecursiveModuleLoad, CoreError>)>;
 
 type CodeCacheReadyFuture = dyn Future<Output = ()>;
 
@@ -69,7 +69,7 @@ use super::ImportMetaResolveCallback;
 
 struct ModEvaluate {
   module_map: Rc<ModuleMap>,
-  sender: Option<oneshot::Sender<Result<(), Error>>>,
+  sender: Option<oneshot::Sender<Result<(), CoreError>>>,
   module: Option<v8::Global<v8::Module>>,
   notify: Vec<v8::Global<v8::Function>>,
 }
@@ -115,6 +115,11 @@ struct DynImportModEvaluate {
   module: v8::Global<v8::Module>,
 }
 
+struct DynImportState {
+  resolver: v8::Global<v8::PromiseResolver>,
+  cped: v8::Global<v8::Value>,
+}
+
 /// A collection of JS modules.
 pub(crate) struct ModuleMap {
   // Handling of futures for loading module sources
@@ -123,8 +128,7 @@ pub(crate) struct ModuleMap {
   pub(crate) import_meta_resolve_cb: ImportMetaResolveCallback,
 
   exception_state: Rc<ExceptionState>,
-  dynamic_import_map:
-    RefCell<HashMap<ModuleLoadId, v8::Global<v8::PromiseResolver>>>,
+  dynamic_import_map: RefCell<HashMap<ModuleLoadId, DynImportState>>,
   preparing_dynamic_imports:
     RefCell<FuturesUnordered<Pin<Box<PrepareLoadFuture>>>>,
   preparing_dynamic_imports_pending: Cell<bool>,
@@ -139,6 +143,7 @@ pub(crate) struct ModuleMap {
   pending_code_cache_ready: Cell<bool>,
   module_waker: AtomicWaker,
   data: RefCell<ModuleMapData>,
+  will_snapshot: bool,
 
   /// A counter used to delay our dynamic import deadlock detection by one spin
   /// of the event loop.
@@ -146,6 +151,16 @@ pub(crate) struct ModuleMap {
 }
 
 impl ModuleMap {
+  /// There is a circular Rc reference between the module map and the futures,
+  /// so when destroying the module map we need to clear the pending futures.
+  pub(crate) fn destroy(&self) {
+    self.dynamic_import_map.borrow_mut().clear();
+    self.preparing_dynamic_imports.borrow_mut().clear();
+    self.pending_dynamic_imports.borrow_mut().clear();
+    self.code_cache_ready_futs.borrow_mut().clear();
+    std::mem::take(&mut *self.data.borrow_mut());
+  }
+
   pub(crate) fn next_load_id(&self) -> i32 {
     // TODO(mmastrac): move recursive module loading into here so we can avoid making this pub
     let mut data = self.data.borrow_mut();
@@ -158,7 +173,7 @@ impl ModuleMap {
   pub(crate) fn check_all_modules_evaluated(
     &self,
     scope: &mut v8::HandleScope,
-  ) -> Result<(), Error> {
+  ) -> Result<(), CoreError> {
     let mut not_evaluated = vec![];
     let data = self.data.borrow();
 
@@ -166,9 +181,10 @@ impl ModuleMap {
       let module = v8::Local::new(scope, handle);
       match module.get_status() {
         v8::ModuleStatus::Errored => {
-          return Err(
-            JsError::from_v8_exception(scope, module.get_exception()).into(),
-          );
+          return Err(CoreError::Js(JsError::from_v8_exception(
+            scope,
+            module.get_exception(),
+          )));
         }
         v8::ModuleStatus::Evaluated => {}
         _ => {
@@ -178,11 +194,7 @@ impl ModuleMap {
     }
 
     if !not_evaluated.is_empty() {
-      let mut msg = String::new();
-      for m in not_evaluated {
-        msg.push_str(&format!("  - {}\n", m));
-      }
-      bail!("Following modules were not evaluated; make sure they are imported from other code:\n {}", msg);
+      return Err(CoreError::NonEvaluatedModules(not_evaluated));
     }
 
     Ok(())
@@ -192,8 +204,10 @@ impl ModuleMap {
     loader: Rc<dyn ModuleLoader>,
     exception_state: Rc<ExceptionState>,
     import_meta_resolve_cb: ImportMetaResolveCallback,
+    will_snapshot: bool,
   ) -> Self {
     Self {
+      will_snapshot,
       loader: loader.into(),
       exception_state,
       import_meta_resolve_cb,
@@ -336,12 +350,9 @@ impl ModuleMap {
     if let Some(module_id) = maybe_module_id {
       return Ok(module_id);
     }
-
     let module_id = match module_type {
       ModuleType::JavaScript => {
-        let code =
-          ModuleSource::get_string_source(module_url_found.as_str(), code)
-            .map_err(ModuleError::Other)?;
+        let code = ModuleSource::get_string_source(code);
 
         let (code_cache_info, module_url_found) =
           if let Some(code_cache) = code_cache {
@@ -374,14 +385,13 @@ impl ModuleMap {
         )?
       }
       ModuleType::Wasm => {
-        return Err(ModuleError::Other(generic_error(
-          "Importing Wasm modules is currently not supported.",
-        )));
+        let ModuleSourceCode::Bytes(code) = code else {
+          return Err(ModuleError::Concrete(ModuleConcreteError::WasmNotBytes));
+        };
+        self.new_wasm_module(scope, module_url_found, code, dynamic)?
       }
       ModuleType::Json => {
-        let code =
-          ModuleSource::get_string_source(module_url_found.as_str(), code)
-            .map_err(ModuleError::Other)?;
+        let code = ModuleSource::get_string_source(code);
         self.new_json_module(scope, module_url_found, code)?
       }
       ModuleType::Other(module_type) => {
@@ -390,10 +400,9 @@ impl ModuleMap {
           state.custom_module_evaluation_cb.as_ref();
 
         let Some(custom_evaluation_cb) = custom_module_evaluation_cb else {
-          return Err(ModuleError::Other(generic_error(format!(
-            "Importing '{}' modules is not supported",
-            module_type
-          ))));
+          return Err(ModuleError::Concrete(
+            ModuleConcreteError::UnsupportedKind(module_type.to_string()),
+          ));
         };
 
         // TODO(bartlomieju): creating a global just to create a local from it
@@ -406,7 +415,7 @@ impl ModuleMap {
           &module_url_found,
           code,
         )
-        .map_err(ModuleError::Other)?;
+        .map_err(|e| ModuleError::Core(CoreError::JsBox(e)))?;
 
         match module_evaluation_kind {
           // Simple case, we just got a single value so we create a regular
@@ -419,7 +428,7 @@ impl ModuleMap {
               module_url_found,
               ModuleType::Other(module_type.clone()),
               exports,
-            )?
+            )
           }
 
           // Complex case - besides a synthetic module, we will create a new
@@ -437,7 +446,7 @@ impl ModuleMap {
               url1,
               synthetic_module_type,
               exports,
-            )?;
+            );
 
             let (code_cache_info, url2) = if let Some(code_cache) = code_cache {
               let (url1, url2) = url2.into_cheap_copy();
@@ -482,13 +491,13 @@ impl ModuleMap {
     name: impl IntoModuleName,
     module_type: ModuleType,
     exports: Vec<(FastStaticString, v8::Local<v8::Value>)>,
-  ) -> Result<ModuleId, ModuleError> {
+  ) -> ModuleId {
     let name = name.into_module_name();
-    let name_str = name.v8_string(scope);
+    let name_str = name.v8_string(scope).unwrap();
 
     let export_names = exports
       .iter()
-      .map(|(name, _)| name.v8_string(scope))
+      .map(|(name, _)| name.v8_string(scope).unwrap())
       .collect::<Vec<_>>();
     let module = v8::Module::create_synthetic_module(
       scope,
@@ -526,7 +535,7 @@ impl ModuleMap {
     // Synthetic modules have no imports so their instantation must never fail.
     self.instantiate_module(scope, id).unwrap();
 
-    Ok(id)
+    id
   }
 
   // TODO(bartlomieju): remove this method or rename it to `new_js_module`.
@@ -558,7 +567,7 @@ impl ModuleMap {
   /// Passed type doesn't have to be [`ModuleType::JavaScript`]! This method
   /// can be used to create "shim" modules, that execute some JS and act as a
   /// proxy to the actual underlying module (eg. you might create a "shim" for
-  /// WASM module).
+  /// Wasm module).
   ///
   /// Imports in the executed code are parsed (along their import attributes)
   /// and attached to associated [`ModuleInfo`].
@@ -579,18 +588,22 @@ impl ModuleMap {
       let data = self.data.borrow();
       if let Some(main_module) = data.main_module_id {
         let main_name = self.data.borrow().get_name_by_id(main_module).unwrap();
-        return Err(ModuleError::Other(generic_error(
-          format!("Trying to create \"main\" module ({:?}), when one already exists ({:?})",
-          name,
-          main_name,
-        ))));
+        return Err(ModuleError::Concrete(
+          ModuleConcreteError::MainModuleAlreadyExists {
+            main_module: main_name.to_string(),
+            new_module: name.to_string(),
+          },
+        ));
       }
     }
 
-    let name_str = name.v8_string(scope);
-    let source_str = source.v8_string(scope);
-
-    let origin = module_origin(scope, name_str);
+    let name_str = name.v8_string(scope).unwrap();
+    let source_str = source.v8_string(scope).unwrap();
+    let host_defined_options = self
+      .loader
+      .borrow()
+      .get_host_defined_options(scope, name.as_str());
+    let origin = script_origin(scope, name_str, true, host_defined_options);
 
     let tc_scope = &mut v8::TryCatch::new(scope);
 
@@ -618,9 +631,12 @@ impl ModuleMap {
         })
       })
       .unwrap_or_else(|| {
-        let source =
+        let mut source =
           v8::script_compiler::Source::new(source_str, Some(&origin));
-        (v8::script_compiler::compile_module(tc_scope, source), true)
+        (
+          v8::script_compiler::compile_module(tc_scope, &mut source),
+          true,
+        )
       });
 
     if tc_scope.has_caught() {
@@ -633,14 +649,16 @@ impl ModuleMap {
 
     let module = maybe_module.unwrap();
 
-    if try_store_code_cache {
+    // V8 does not support creating code caches while also snapshotting,
+    // and it's not needed anyway, as the snapshot already contains it.
+    if try_store_code_cache && !self.will_snapshot {
       if let Some(code_cache_info) = code_cache_info.take() {
         let unbound_module_script = module.get_unbound_module_script(tc_scope);
         let code_cache =
           unbound_module_script.create_code_cache().ok_or_else(|| {
-            ModuleError::Other(generic_error(
-              "Unable to get code cache from unbound module script",
-            ))
+            ModuleError::Concrete(
+              ModuleConcreteError::UnboundModuleScriptCodeCache,
+            )
           })?;
         let fut =
           async move { (code_cache_info.ready_callback)(&code_cache).await }
@@ -698,7 +716,7 @@ impl ModuleMap {
         },
       ) {
         Ok(s) => s,
-        Err(e) => return Err(ModuleError::Other(e)),
+        Err(e) => return Err(ModuleError::Core(e)),
       };
       let requested_module_type =
         get_requested_module_type_from_attributes(&attributes);
@@ -719,6 +737,48 @@ impl ModuleMap {
     );
 
     Ok(id)
+  }
+
+  pub(crate) fn new_wasm_module(
+    &self,
+    scope: &mut v8::HandleScope,
+    name: ModuleName,
+    source: ModuleCodeBytes,
+    is_dynamic_import: bool,
+  ) -> Result<ModuleId, ModuleError> {
+    let bytes = source.as_bytes();
+    let wasm_module_analysis = WasmDeps::parse(
+      bytes,
+      wasm_dep_analyzer::ParseOptions { skip_types: true },
+    )
+    .map_err(ModuleConcreteError::WasmParse)?;
+
+    let Some(wasm_module) = v8::WasmModuleObject::compile(scope, bytes) else {
+      return Err(ModuleConcreteError::WasmCompile(name.to_string()).into());
+    };
+    let wasm_module_value: v8::Local<v8::Value> = wasm_module.into();
+
+    let js_wasm_module_source =
+      render_js_wasm_module(name.as_str(), wasm_module_analysis);
+
+    let synthetic_module_type =
+      ModuleType::Other("$$deno-core-internal-wasm-module".into());
+
+    let (name1, name2) = name.into_cheap_copy();
+    let value = v8::Local::new(scope, wasm_module_value);
+    let exports = vec![(ascii_str!("default"), value)];
+    let _synthetic_mod_id =
+      self.new_synthetic_module(scope, name1, synthetic_module_type, exports);
+
+    self.new_module_from_js_source(
+      scope,
+      false,
+      ModuleType::Wasm,
+      name2,
+      js_wasm_module_source.into(),
+      is_dynamic_import,
+      None,
+    )
   }
 
   pub(crate) fn new_json_module(
@@ -747,7 +807,7 @@ impl ModuleMap {
       }
     };
     let exports = vec![(ascii_str!("default"), parsed_json)];
-    self.new_synthetic_module(tc_scope, name, ModuleType::Json, exports)
+    Ok(self.new_synthetic_module(tc_scope, name, ModuleType::Json, exports))
   }
 
   pub(crate) fn instantiate_module(
@@ -764,6 +824,13 @@ impl ModuleMap {
 
     if module.get_status() == v8::ModuleStatus::Errored {
       return Err(v8::Global::new(tc_scope, module.get_exception()));
+    }
+
+    // FIXME: instantiate_module is called more than it should be,
+    // especially for dynamic imports. As a hack, bail out if the
+    // module status is already being instantiated.
+    if module.get_status() != v8::ModuleStatus::Uninstantiated {
+      return Ok(());
     }
 
     tc_scope.set_slot(self as *const _);
@@ -818,10 +885,12 @@ impl ModuleMap {
       return Some(module);
     }
 
-    let msg = format!(
-      r#"Cannot resolve module "{specifier_str}" from "{referrer_name}""#
+    crate::error::throw_js_error_class(
+      scope,
+      &JsErrorBox::type_error(format!(
+        r#"Cannot resolve module "{specifier_str}" from "{referrer_name}""#
+      )),
     );
-    throw_type_error(scope, msg);
     None
   }
 
@@ -833,7 +902,7 @@ impl ModuleMap {
     specifier: &str,
     referrer: &str,
     kind: ResolutionKind,
-  ) -> Result<ModuleSpecifier, AnyError> {
+  ) -> Result<ModuleSpecifier, CoreError> {
     if specifier.starts_with("ext:")
       && !referrer.starts_with("ext:")
       && !referrer.starts_with("node:")
@@ -846,11 +915,18 @@ impl ModuleMap {
       } else {
         referrer
       };
-      let msg = format!("Importing ext: modules is only allowed from ext: and node: modules. Tried to import {} from {}", specifier, referrer);
-      return Err(generic_error(msg));
+      let msg = format!(
+        "Importing ext: modules is only allowed from ext: and node: modules. Tried to import {} from {}",
+        specifier, referrer
+      );
+      return Err(JsErrorBox::type_error(msg).into());
     }
 
-    self.loader.borrow().resolve(specifier, referrer, kind)
+    self
+      .loader
+      .borrow()
+      .resolve(specifier, referrer, kind)
+      .map_err(|e| e.into())
   }
 
   /// Called by `module_resolve_callback` during module instantiation.
@@ -865,7 +941,7 @@ impl ModuleMap {
       match self.resolve(specifier, referrer, ResolutionKind::Import) {
         Ok(s) => s,
         Err(e) => {
-          throw_type_error(scope, e.to_string());
+          crate::error::throw_js_error_class(scope, &e);
           return None;
         }
       };
@@ -893,7 +969,7 @@ impl ModuleMap {
   pub(crate) async fn load_main(
     module_map_rc: Rc<ModuleMap>,
     specifier: impl AsRef<str>,
-  ) -> Result<RecursiveModuleLoad, Error> {
+  ) -> Result<RecursiveModuleLoad, CoreError> {
     let load =
       RecursiveModuleLoad::main(specifier.as_ref(), module_map_rc.clone());
     load.prepare().await?;
@@ -903,7 +979,7 @@ impl ModuleMap {
   pub(crate) async fn load_side(
     module_map_rc: Rc<ModuleMap>,
     specifier: impl AsRef<str>,
-  ) -> Result<RecursiveModuleLoad, Error> {
+  ) -> Result<RecursiveModuleLoad, CoreError> {
     let load =
       RecursiveModuleLoad::side(specifier.as_ref(), module_map_rc.clone());
     load.prepare().await?;
@@ -913,42 +989,64 @@ impl ModuleMap {
   // Initiate loading of a module graph imported using `import()`.
   pub(crate) fn load_dynamic_import(
     self: Rc<Self>,
+    scope: &mut v8::HandleScope,
     specifier: &str,
     referrer: &str,
     requested_module_type: RequestedModuleType,
     resolver_handle: v8::Global<v8::PromiseResolver>,
-  ) {
+    cped_handle: v8::Global<v8::Value>,
+  ) -> bool {
+    let resolve_result =
+      self.resolve(specifier, referrer, ResolutionKind::DynamicImport);
+
+    if let Ok(module_specifier) = &resolve_result {
+      if let Some(id) = self
+        .data
+        .borrow()
+        .get_id(module_specifier.as_str(), &requested_module_type)
+      {
+        let module = self
+          .data
+          .borrow()
+          .get_handle(id)
+          .map(|handle| v8::Local::new(scope, handle))
+          .expect("Dyn import module info not found");
+
+        if module.get_status() == v8::ModuleStatus::Evaluated {
+          let resolver = resolver_handle.open(scope);
+          let module_namespace = module.get_module_namespace();
+          resolver.resolve(scope, module_namespace).unwrap();
+
+          return false;
+        }
+      }
+    }
+
     let load = RecursiveModuleLoad::dynamic_import(
       specifier,
       referrer,
-      requested_module_type.clone(),
+      requested_module_type,
       self.clone(),
     );
 
-    self
-      .dynamic_import_map
-      .borrow_mut()
-      .insert(load.id, resolver_handle);
+    self.dynamic_import_map.borrow_mut().insert(
+      load.id,
+      DynImportState {
+        resolver: resolver_handle,
+        cped: cped_handle,
+      },
+    );
 
-    let resolve_result =
-      self.resolve(specifier, referrer, ResolutionKind::DynamicImport);
     let fut = match resolve_result {
-      Ok(module_specifier) => {
-        if self
-          .data
-          .borrow()
-          .is_registered(module_specifier.as_str(), requested_module_type)
-        {
-          async move { (load.id, Ok(load)) }.boxed_local()
-        } else {
-          async move { (load.id, load.prepare().await.map(|()| load)) }
-            .boxed_local()
-        }
-      }
+      Ok(_) => async move { (load.id, load.prepare().await.map(|()| load)) }
+        .boxed_local(),
       Err(error) => async move { (load.id, Err(error)) }.boxed_local(),
     };
+
     self.preparing_dynamic_imports.borrow_mut().push(fut);
     self.preparing_dynamic_imports_pending.set(true);
+
+    true
   }
 
   pub(crate) fn has_pending_dynamic_imports(&self) -> bool {
@@ -968,7 +1066,7 @@ impl ModuleMap {
     self: &Rc<Self>,
     scope: &mut v8::HandleScope,
     id: ModuleId,
-  ) -> impl Future<Output = Result<(), Error>> + Unpin {
+  ) -> impl Future<Output = Result<(), CoreError>> + Unpin + use<> {
     let tc_scope = &mut v8::TryCatch::new(scope);
 
     let module = self
@@ -990,11 +1088,8 @@ impl ModuleMap {
     );
 
     let (sender, receiver) = oneshot::channel();
-    let receiver = receiver.map(|res| {
-      res.unwrap_or_else(|_| {
-        bail!("Cannot evaluate module, because JavaScript execution has been terminated")
-      }
-    )});
+    let receiver = receiver
+      .map(|res| res.unwrap_or_else(|_| Err(CoreError::ExecutionTerminated)));
 
     let Some(value) = module.evaluate(tc_scope) else {
       if tc_scope.has_terminated() || tc_scope.is_execution_terminating() {
@@ -1016,7 +1111,7 @@ impl ModuleMap {
       // This will be overridden in `exception_to_err_result()`.
       let exception = v8::undefined(tc_scope).into();
       sender
-        .send(exception_to_err_result(tc_scope, exception, false, false))
+        .send(exception_to_err_result(tc_scope, exception, true, false))
         .expect("Failed to send module evaluation error.");
     } else {
       debug_assert!(
@@ -1142,31 +1237,62 @@ impl ModuleMap {
     self: &Rc<Self>,
     scope: &mut v8::HandleScope,
     id: ModuleId,
-  ) -> Result<(), Error> {
-    let mut receiver = self.mod_evaluate(scope, id);
+  ) -> Result<(), CoreError> {
+    let tc_scope = &mut v8::TryCatch::new(scope);
 
-    // After evaluate_pending_module, if the module isn't fully evaluated
-    // and the resolver solved, it means the module or one of its imports
-    // uses TLA.
-    match receiver.poll_unpin(&mut Context::from_waker(noop_waker_ref())) {
-      Poll::Ready(result) => {
-        result.with_context(|| {
-          let specifier = self.get_name_by_id(id).unwrap();
-          format!("Couldn't execute '{specifier}'")
-        })?;
-      }
-      Poll::Pending => {
-        // Find the TLA location and return it as an error
-        let messages = self.find_stalled_top_level_await(scope);
-        assert!(!messages.is_empty());
-        let msg = v8::Local::new(scope, &messages[0]);
-        let js_error = JsError::from_v8_message(scope, msg);
-        return Err(Error::from(js_error))
-          .with_context(|| "Top-level await is not allowed in extensions");
-      }
+    let module = self
+      .get_handle(id)
+      .map(|handle| v8::Local::new(tc_scope, handle))
+      .expect("ModuleInfo not found");
+    let status = module.get_status();
+    assert_eq!(
+      status,
+      v8::ModuleStatus::Instantiated,
+      "{} {} ({})",
+      if status == v8::ModuleStatus::Evaluated {
+        "Module already evaluated. Perhaps you've re-provided a module or extension that was already included in the snapshot?"
+      } else {
+        "Module not instantiated"
+      },
+      self.get_name_by_id(id).unwrap(),
+      id,
+    );
+
+    if module.is_graph_async() {
+      return Err(CoreError::TLA);
     }
 
-    Ok(())
+    let Some(value) = module.evaluate(tc_scope) else {
+      let exception = tc_scope.exception().unwrap();
+      return Err(CoreError::Js(JsError::from_v8_exception(
+        tc_scope, exception,
+      )));
+    };
+
+    if let Some(exception) = tc_scope.exception() {
+      return Err(CoreError::Js(JsError::from_v8_exception(
+        tc_scope, exception,
+      )));
+    }
+
+    let status = module.get_status();
+    debug_assert!(
+      status == v8::ModuleStatus::Evaluated
+        || status == v8::ModuleStatus::Errored
+    );
+    let promise = v8::Local::<v8::Promise>::try_from(value)
+      .expect("Expected to get promise as module evaluation result");
+
+    match promise.state() {
+      PromiseState::Fulfilled => Ok(()),
+      PromiseState::Rejected => {
+        let err = promise.result(tc_scope);
+        Err(CoreError::Js(JsError::from_v8_exception(tc_scope, err)))
+      }
+      PromiseState::Pending => {
+        unreachable!()
+      }
+    }
   }
 
   fn dynamic_import_module_evaluate(
@@ -1174,7 +1300,7 @@ impl ModuleMap {
     scope: &mut v8::HandleScope,
     load_id: ModuleLoadId,
     id: ModuleId,
-  ) -> Result<(), Error> {
+  ) -> Result<(), CoreError> {
     let module_handle = self.get_handle(id).expect("ModuleInfo not found");
 
     let status = {
@@ -1191,14 +1317,27 @@ impl ModuleMap {
     // of module evaluation is a promise.
     //
     // This promise is internal, and not the same one that gets returned to
-    // the user. We add an empty `.catch()` handler so that it does not result
-    // in an exception if it rejects. That will instead happen for the other
-    // promise if not handled by the user.
+    // the user. We add handlers to wake the event loop when the promise resolves
+    // (or rejects). The catch handler also serves to prevent an exception if the internal promise
+    // rejects. That will instead happen for the other if not handled by the user.
     //
     // For more details see:
     // https://github.com/denoland/deno/issues/4908
     // https://v8.dev/features/top-level-await#module-execution-order
     let tc_scope = &mut v8::TryCatch::new(scope);
+
+    {
+      let cped = self
+        .dynamic_import_map
+        .borrow()
+        .get(&load_id)
+        .unwrap()
+        .cped
+        .clone();
+      let cped = v8::Local::new(tc_scope, cped);
+      tc_scope.set_continuation_preserved_embedder_data(cped);
+    }
+
     let module = v8::Local::new(tc_scope, &module_handle);
     let maybe_value = module.evaluate(tc_scope);
 
@@ -1210,11 +1349,28 @@ impl ModuleMap {
         status == v8::ModuleStatus::Evaluated
           || status == v8::ModuleStatus::Errored
       );
+
+      fn wake_module(
+        scope: &mut v8::HandleScope<'_>,
+        _args: v8::FunctionCallbackArguments<'_>,
+        _rv: v8::ReturnValue,
+      ) {
+        let module_map = JsRealm::module_map_from(scope);
+        module_map.module_waker.wake();
+      }
+
       let promise = v8::Local::<v8::Promise>::try_from(value)
         .expect("Expected to get promise as module evaluation result");
-      let empty_fn =
-        crate::runtime::bindings::create_empty_fn(tc_scope).unwrap();
-      promise.catch(tc_scope, empty_fn);
+
+      let wake_module_cb = Function::builder(wake_module).build(tc_scope);
+
+      if let Some(wake_module_cb) = wake_module_cb {
+        promise.then2(tc_scope, wake_module_cb, wake_module_cb);
+      } else {
+        // If the runtime is shutting down, we can't attach the handlers.
+        // It doesn't really matter though, because they're just for waking the
+        // event loop.
+      }
       let promise_global = v8::Global::new(tc_scope, promise);
       let module_global = v8::Global::new(tc_scope, module);
 
@@ -1231,9 +1387,7 @@ impl ModuleMap {
         .push(dyn_import_mod_evaluate);
       self.pending_dyn_mod_evaluations_pending.set(true);
     } else if tc_scope.has_terminated() || tc_scope.is_execution_terminating() {
-      return Err(
-        generic_error("Cannot evaluate dynamically imported module, because JavaScript execution has been terminated.")
-      );
+      return Err(CoreError::EvaluateDynamicImportedModule);
     } else {
       assert_eq!(status, v8::ModuleStatus::Errored);
     }
@@ -1303,7 +1457,8 @@ impl ModuleMap {
       .dynamic_import_map
       .borrow_mut()
       .remove(&id)
-      .expect("Invalid dynamic import id");
+      .expect("Invalid dynamic import id")
+      .resolver;
     let resolver = resolver_handle.open(scope);
 
     let exception = v8::Local::new(scope, exception);
@@ -1321,7 +1476,8 @@ impl ModuleMap {
       .dynamic_import_map
       .borrow_mut()
       .remove(&id)
-      .expect("Invalid dynamic import id");
+      .expect("Invalid dynamic import id")
+      .resolver;
     let resolver = resolver_handle.open(scope);
 
     let module = self
@@ -1349,7 +1505,7 @@ impl ModuleMap {
     &self,
     cx: &mut Context,
     scope: &mut v8::HandleScope,
-  ) -> Result<(), Error> {
+  ) -> Result<(), CoreError> {
     let mut has_evaluated = true;
 
     // TODO(mmastrac): We register this waker unconditionally because we occasionally need to re-run
@@ -1400,7 +1556,7 @@ impl ModuleMap {
     &self,
     cx: &mut Context,
     scope: &mut v8::HandleScope,
-  ) -> Poll<Result<(), Error>> {
+  ) -> Poll<Result<(), CoreError>> {
     if !self.preparing_dynamic_imports_pending.get() {
       return Poll::Ready(Ok(()));
     }
@@ -1420,11 +1576,11 @@ impl ModuleMap {
             self
               .pending_dynamic_imports
               .borrow_mut()
-              .push(load.into_future());
+              .push(StreamExt::into_future(load));
             self.pending_dynamic_imports_pending.set(true);
           }
           Err(err) => {
-            let exception = to_v8_type_error(scope, err);
+            let exception = err.to_v8_error(scope);
             self.dynamic_import_reject(scope, dyn_import_id, exception);
           }
         }
@@ -1444,7 +1600,7 @@ impl ModuleMap {
     &self,
     cx: &mut Context,
     scope: &mut v8::HandleScope,
-  ) -> Poll<Result<(), Error>> {
+  ) -> Poll<Result<(), CoreError>> {
     if !self.pending_dynamic_imports_pending.get() {
       return Poll::Ready(Ok(()));
     }
@@ -1460,55 +1616,61 @@ impl ModuleMap {
         let mut load = load_stream_poll.1;
         let dyn_import_id = load.id;
 
-        if let Some(load_stream_result) = maybe_result {
-          match load_stream_result {
-            Ok((request, info)) => {
-              // A module (not necessarily the one dynamically imported) has been
-              // fetched. Create and register it, and if successful, poll for the
-              // next recursive-load event related to this dynamic import.
-              let register_result =
-                load.register_and_recurse(scope, &request, info);
+        match maybe_result {
+          Some(load_stream_result) => {
+            match load_stream_result {
+              Ok((request, info)) => {
+                // A module (not necessarily the one dynamically imported) has been
+                // fetched. Create and register it, and if successful, poll for the
+                // next recursive-load event related to this dynamic import.
+                let register_result =
+                  load.register_and_recurse(scope, &request, info);
 
-              match register_result {
-                Ok(()) => {
-                  // Keep importing until it's fully drained
-                  self
-                    .pending_dynamic_imports
-                    .borrow_mut()
-                    .push(load.into_future());
-                  self.pending_dynamic_imports_pending.set(true);
-                }
-                Err(err) => {
-                  let exception = match err {
-                    ModuleError::Exception(e) => e,
-                    ModuleError::Other(e) => to_v8_type_error(scope, e),
-                  };
-                  self.dynamic_import_reject(scope, dyn_import_id, exception)
+                match register_result {
+                  Ok(()) => {
+                    // Keep importing until it's fully drained
+                    self
+                      .pending_dynamic_imports
+                      .borrow_mut()
+                      .push(StreamExt::into_future(load));
+                    self.pending_dynamic_imports_pending.set(true);
+                  }
+                  Err(err) => {
+                    let exception = match err {
+                      ModuleError::Exception(e) => e,
+                      ModuleError::Core(e) => e.to_v8_error(scope),
+                      ModuleError::Concrete(e) => {
+                        CoreError::Module(e).to_v8_error(scope)
+                      }
+                    };
+                    self.dynamic_import_reject(scope, dyn_import_id, exception)
+                  }
                 }
               }
+              Err(err) => {
+                // A non-javascript error occurred; this could be due to an invalid
+                // module specifier, or a problem with the source map, or a failure
+                // to fetch the module source code.
+                let exception = err.to_v8_error(scope);
+                self.dynamic_import_reject(scope, dyn_import_id, exception);
+              }
             }
-            Err(err) => {
-              // A non-javascript error occurred; this could be due to a an invalid
-              // module specifier, or a problem with the source map, or a failure
-              // to fetch the module source code.
-              let exception = to_v8_type_error(scope, err);
+          }
+          _ => {
+            // The top-level module from a dynamic import has been instantiated.
+            // Load is done.
+            let module_id =
+              load.root_module_id.expect("Root module should be loaded");
+            let result = self.instantiate_module(scope, module_id);
+            if let Err(exception) = result {
               self.dynamic_import_reject(scope, dyn_import_id, exception);
             }
+            self.dynamic_import_module_evaluate(
+              scope,
+              dyn_import_id,
+              module_id,
+            )?;
           }
-        } else {
-          // The top-level module from a dynamic import has been instantiated.
-          // Load is done.
-          let module_id =
-            load.root_module_id.expect("Root module should be loaded");
-          let result = self.instantiate_module(scope, module_id);
-          if let Err(exception) = result {
-            self.dynamic_import_reject(scope, dyn_import_id, exception);
-          }
-          self.dynamic_import_module_evaluate(
-            scope,
-            dyn_import_id,
-            module_id,
-          )?;
         }
 
         // Continue polling for more ready dynamic imports.
@@ -1523,7 +1685,10 @@ impl ModuleMap {
     }
   }
 
-  fn poll_code_cache_ready(&self, cx: &mut Context) -> Poll<Result<(), Error>> {
+  fn poll_code_cache_ready(
+    &self,
+    cx: &mut Context,
+  ) -> Poll<Result<(), CoreError>> {
     if !self.pending_code_cache_ready.get() {
       return Poll::Ready(Ok(()));
     }
@@ -1543,6 +1708,18 @@ impl ModuleMap {
     }
   }
 
+  pub(crate) fn get_module<'s>(
+    &self,
+    scope: &mut v8::HandleScope<'s>,
+    module_id: ModuleId,
+  ) -> Option<v8::Local<'s, v8::Module>> {
+    self
+      .data
+      .borrow()
+      .get_handle(module_id)
+      .map(|g| v8::Local::new(scope, g))
+  }
+
   /// Returns the namespace object of a module.
   ///
   /// This is only available after module evaluation has completed.
@@ -1551,7 +1728,7 @@ impl ModuleMap {
     &self,
     scope: &mut v8::HandleScope,
     module_id: ModuleId,
-  ) -> Result<v8::Global<v8::Object>, Error> {
+  ) -> Result<v8::Global<v8::Object>, CoreError> {
     let module_handle = self
       .data
       .borrow()
@@ -1571,8 +1748,7 @@ impl ModuleMap {
     ));
 
     let module_namespace: v8::Local<v8::Object> =
-      v8::Local::try_from(module.get_module_namespace())
-        .map_err(|err: v8::DataError| generic_error(err.to_string()))?;
+      v8::Local::try_from(module.get_module_namespace())?;
 
     Ok(v8::Global::new(scope, module_namespace))
   }
@@ -1648,7 +1824,7 @@ impl ModuleMap {
     module_specifier: &str,
     source_code: ModuleCodeString,
     code_cache_info: Option<CodeCacheInfo>,
-  ) -> Result<v8::Global<v8::Value>, Error> {
+  ) -> Result<v8::Global<v8::Value>, CoreError> {
     let specifier = ModuleSpecifier::parse(module_specifier)?;
     let mod_id = self
       .new_es_module(
@@ -1659,7 +1835,7 @@ impl ModuleMap {
         false,
         code_cache_info,
       )
-      .map_err(|e| e.into_any_error(scope, false, true))?;
+      .map_err(|e| e.into_error(scope, false, true))?;
 
     self.instantiate_module(scope, mod_id).map_err(|e| {
       let exception = v8::Local::new(scope, e);
@@ -1695,11 +1871,13 @@ impl ModuleMap {
     code: ModuleCodeString,
   ) {
     let data = self.data.borrow_mut();
-    assert!(data
-      .lazy_esm_sources
-      .borrow_mut()
-      .insert(specifier, code)
-      .is_none());
+    assert!(
+      data
+        .lazy_esm_sources
+        .borrow_mut()
+        .insert(specifier, code)
+        .is_none()
+    );
   }
 
   /// Lazy load and evaluate an ES module. Only modules that have been added
@@ -1709,7 +1887,7 @@ impl ModuleMap {
     &self,
     scope: &mut v8::HandleScope,
     module_specifier: &str,
-  ) -> Result<v8::Global<v8::Value>, Error> {
+  ) -> Result<v8::Global<v8::Value>, CoreError> {
     let lazy_esm_sources = self.data.borrow().lazy_esm_sources.clone();
     let loader = LazyEsmModuleLoader::new(lazy_esm_sources);
 
@@ -1740,7 +1918,7 @@ impl ModuleMap {
     self.lazy_load_es_module_with_code(
       scope,
       module_specifier,
-      ModuleSource::get_string_source(specifier.as_str(), source.code)?,
+      ModuleSource::get_string_source(source.code),
       if let Some(code_cache) = source.code_cache {
         let loader = self.loader.borrow().clone();
         Some(CodeCacheInfo {
@@ -1781,9 +1959,11 @@ pub(crate) fn synthetic_module_evaluation_steps<'a>(
     let value = v8::Local::new(tc_scope, export_value);
 
     // This should never fail
-    assert!(module
-      .set_synthetic_module_export(tc_scope, name, value)
-      .unwrap());
+    assert!(
+      module
+        .set_synthetic_module_export(tc_scope, name, value)
+        .unwrap()
+    );
     assert!(!tc_scope.has_caught());
   }
 
@@ -1795,21 +1975,298 @@ pub(crate) fn synthetic_module_evaluation_steps<'a>(
   Some(resolver.get_promise(tc_scope).into())
 }
 
-pub fn module_origin<'a>(
+pub fn script_origin<'a>(
   s: &mut v8::HandleScope<'a>,
   resource_name: v8::Local<'a, v8::String>,
+  is_module: bool,
+  host_defined_options: Option<v8::Local<'a, v8::Data>>,
 ) -> v8::ScriptOrigin<'a> {
-  let source_map_url = v8::String::empty(s);
   v8::ScriptOrigin::new(
     s,
     resource_name.into(),
     0,
     0,
     false,
-    123,
-    source_map_url.into(),
-    true,
+    0,
+    None,
     false,
-    true,
+    false,
+    is_module,
+    host_defined_options,
   )
+}
+
+fn render_js_wasm_module(specifier: &str, wasm_deps: WasmDeps) -> String {
+  struct ImportInfo {
+    key_escaped: String,
+    escaped_named_imports: Vec<String>,
+  }
+
+  fn aggregate_wasm_module_imports<'a>(
+    imports: &'a [wasm_dep_analyzer::Import],
+  ) -> IndexMap<&'a str, ImportInfo> {
+    let mut imports_map = IndexMap::with_capacity(imports.len());
+
+    for import in imports {
+      let entry =
+        imports_map
+          .entry(import.module)
+          .or_insert_with(|| ImportInfo {
+            key_escaped: import.module.escape_default().to_string(),
+            escaped_named_imports: Vec::new(),
+          });
+      entry
+        .escaped_named_imports
+        .push(import.name.escape_default().to_string());
+    }
+
+    imports_map
+  }
+
+  let aggregated_imports = aggregate_wasm_module_imports(&wasm_deps.imports);
+  let escaped_export_names = wasm_deps
+    .exports
+    .iter()
+    .map(|e| {
+      if e.name == "default" {
+        Cow::Borrowed(e.name)
+      } else {
+        Cow::Owned(e.name.escape_default().to_string())
+      }
+    })
+    .collect::<Vec<_>>();
+
+  StringBuilder::build(|builder| {
+    builder.append("import wasmMod from \"");
+    builder.append(specifier);
+    builder.append("\" with { type: \"$$deno-core-internal-wasm-module\" };\n");
+
+    if !aggregated_imports.is_empty() {
+      for (i, (_, import_info)) in aggregated_imports.iter().enumerate() {
+        builder.append("import { ");
+        for (name_index, named_import) in import_info.escaped_named_imports.iter().enumerate() {
+          if name_index > 0 {
+            builder.append(", ");
+          }
+          builder.append('"');
+          builder.append(named_import);
+          builder.append("\" as import_");
+          builder.append(i);
+          builder.append('_');
+          builder.append(name_index);
+        }
+        builder.append(" } from \"");
+        builder.append(&import_info.key_escaped);
+        builder.append("\";\n");
+      }
+
+      builder.append("const importsObject = {\n");
+
+      for (i, (_, import_info)) in aggregated_imports.iter().enumerate() {
+        builder.append("  \"");
+        builder.append(&import_info.key_escaped);
+        builder.append("\": {\n");
+
+        for (name_index, named_import) in import_info.escaped_named_imports.iter().enumerate() {
+          builder.append("    \"");
+          builder.append(named_import);
+          builder.append("\": import_");
+          builder.append(i);
+          builder.append('_');
+          builder.append(name_index);
+          builder.append(",\n");
+        }
+
+        builder.append("  },\n");
+      }
+
+      builder.append("};\n");
+
+      builder.append("const modInstance = new import.meta.WasmInstance(wasmMod, importsObject);\n");
+    } else {
+      builder.append(
+        "const modInstance = new import.meta.WasmInstance(wasmMod);\n"
+      );
+    }
+
+    for (idx, escaped_name) in escaped_export_names.iter().enumerate() {
+      if escaped_name == "default" {
+        builder.append("export default modInstance.exports.");
+        builder.append(escaped_name);
+        builder.append(";\n");
+      } else {
+        builder.append("const export");
+        builder.append(idx);
+        builder.append(" = modInstance.exports[\"");
+        builder.append(escaped_name);
+        builder.append("\"];\nexport { export");
+        builder.append(idx);
+        builder.append(" as \"");
+        builder.append(escaped_name);
+        builder.append("\" };\n");
+      }
+    }
+  }).unwrap()
+}
+
+#[test]
+fn test_render_js_wasm_module() {
+  let deps = WasmDeps {
+    imports: vec![],
+    exports: vec![],
+  };
+  let rendered = render_js_wasm_module("./foo.wasm", deps);
+  pretty_assertions::assert_eq!(
+    rendered,
+    r#"import wasmMod from "./foo.wasm" with { type: "$$deno-core-internal-wasm-module" };
+const modInstance = new import.meta.WasmInstance(wasmMod);
+"#,
+  );
+
+  let deps = WasmDeps {
+    imports: vec![
+      wasm_dep_analyzer::Import {
+        name: "foo",
+        module: "./import.js",
+        import_type: wasm_dep_analyzer::ImportType::Tag(
+          wasm_dep_analyzer::TagType {
+            kind: 1,
+            type_index: 1,
+          },
+        ),
+      },
+      wasm_dep_analyzer::Import {
+        name: "bar",
+        module: "./import.js",
+        import_type: wasm_dep_analyzer::ImportType::Function(1),
+      },
+      wasm_dep_analyzer::Import {
+        name: "fizz",
+        module: "./import.js",
+        import_type: wasm_dep_analyzer::ImportType::Function(2),
+      },
+      wasm_dep_analyzer::Import {
+        name: "buzz",
+        module: "./buzz.js",
+        import_type: wasm_dep_analyzer::ImportType::Function(3),
+      },
+    ],
+    exports: vec![
+      wasm_dep_analyzer::Export {
+        name: "export1",
+        index: 0,
+        export_type: wasm_dep_analyzer::ExportType::Function(Ok(
+          wasm_dep_analyzer::FunctionSignature {
+            params: vec![],
+            returns: vec![],
+          },
+        )),
+      },
+      wasm_dep_analyzer::Export {
+        name: "export2",
+        index: 1,
+        export_type: wasm_dep_analyzer::ExportType::Table,
+      },
+      wasm_dep_analyzer::Export {
+        name: "export3",
+        index: 2,
+        export_type: wasm_dep_analyzer::ExportType::Memory,
+      },
+      wasm_dep_analyzer::Export {
+        name: "export4",
+        index: 3,
+        export_type: wasm_dep_analyzer::ExportType::Global(Ok(
+          wasm_dep_analyzer::GlobalType {
+            value_type: wasm_dep_analyzer::ValueType::F32,
+            mutability: false,
+          },
+        )),
+      },
+      wasm_dep_analyzer::Export {
+        name: "export5",
+        index: 4,
+        export_type: wasm_dep_analyzer::ExportType::Tag,
+      },
+      wasm_dep_analyzer::Export {
+        name: "export6",
+        index: 5,
+        export_type: wasm_dep_analyzer::ExportType::Unknown,
+      },
+      wasm_dep_analyzer::Export {
+        name: "default",
+        index: 6,
+        export_type: wasm_dep_analyzer::ExportType::Function(Ok(
+          wasm_dep_analyzer::FunctionSignature {
+            params: vec![],
+            returns: vec![],
+          },
+        )),
+      },
+    ],
+  };
+  let rendered = render_js_wasm_module("./foo.wasm", deps);
+  pretty_assertions::assert_eq!(
+    rendered,
+    r#"import wasmMod from "./foo.wasm" with { type: "$$deno-core-internal-wasm-module" };
+import { "foo" as import_0_0, "bar" as import_0_1, "fizz" as import_0_2 } from "./import.js";
+import { "buzz" as import_1_0 } from "./buzz.js";
+const importsObject = {
+  "./import.js": {
+    "foo": import_0_0,
+    "bar": import_0_1,
+    "fizz": import_0_2,
+  },
+  "./buzz.js": {
+    "buzz": import_1_0,
+  },
+};
+const modInstance = new import.meta.WasmInstance(wasmMod, importsObject);
+const export0 = modInstance.exports["export1"];
+export { export0 as "export1" };
+const export1 = modInstance.exports["export2"];
+export { export1 as "export2" };
+const export2 = modInstance.exports["export3"];
+export { export2 as "export3" };
+const export3 = modInstance.exports["export4"];
+export { export3 as "export4" };
+const export4 = modInstance.exports["export5"];
+export { export4 as "export5" };
+const export5 = modInstance.exports["export6"];
+export { export5 as "export6" };
+export default modInstance.exports.default;
+"#,
+  );
+
+  let deps = WasmDeps {
+    imports: vec![wasm_dep_analyzer::Import {
+      name: "\n",
+      module: "\n",
+      import_type: wasm_dep_analyzer::ImportType::Function(1),
+    }],
+    exports: vec![wasm_dep_analyzer::Export {
+      name: "\n",
+      index: 0,
+      export_type: wasm_dep_analyzer::ExportType::Function(Ok(
+        wasm_dep_analyzer::FunctionSignature {
+          params: vec![],
+          returns: vec![],
+        },
+      )),
+    }],
+  };
+  let rendered = render_js_wasm_module("./bar.wasm", deps);
+  pretty_assertions::assert_eq!(
+    rendered,
+    r#"import wasmMod from "./bar.wasm" with { type: "$$deno-core-internal-wasm-module" };
+import { "\n" as import_0_0 } from "\n";
+const importsObject = {
+  "\n": {
+    "\n": import_0_0,
+  },
+};
+const modInstance = new import.meta.WasmInstance(wasmMod, importsObject);
+const export0 = modInstance.exports["\n"];
+export { export0 as "\n" };
+"#,
+  );
 }

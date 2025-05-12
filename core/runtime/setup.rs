@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use crate::V8_WRAPPER_OBJECT_INDEX;
 use crate::V8_WRAPPER_TYPE_INDEX;
@@ -6,19 +6,21 @@ use crate::V8_WRAPPER_TYPE_INDEX;
 use super::bindings;
 use super::snapshot;
 use super::snapshot::V8Snapshot;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::borrow::Cow;
 use std::sync::Mutex;
 use std::sync::Once;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 fn v8_init(
   v8_platform: Option<v8::SharedRef<v8::Platform>>,
   snapshot: bool,
   expose_natives: bool,
+  import_assertions_enabled: bool,
 ) {
   #[cfg(feature = "include_icu_data")]
   {
-    v8::icu::set_common_data_73(deno_core_icudata::ICU_DATA).unwrap();
+    v8::icu::set_common_data_74(deno_core_icudata::ICU_DATA).unwrap();
   }
 
   let base_flags = concat!(
@@ -35,14 +37,34 @@ fn v8_init(
   } else {
     ""
   };
+  let import_assertions_flag = if import_assertions_enabled {
+    "--harmony-import-assertions"
+  } else {
+    "--no-harmony-import-assertions"
+  };
+  // TODO(bartlomieju): this is ridiculous, rewrite this
   #[allow(clippy::useless_format)]
-  let flags = match (snapshot, expose_natives) {
-    (false, false) => format!("{base_flags}"),
-    (true, false) => format!("{base_flags} {snapshot_flags} {lazy_flags}"),
-    (false, true) => format!("{base_flags} {expose_natives_flags}"),
-    (true, true) => {
+  let flags = match (snapshot, expose_natives, import_assertions_enabled) {
+    (false, false, false) => format!("{base_flags}"),
+    (false, false, true) => format!("{base_flags} {import_assertions_flag}"),
+    (true, false, false) => {
+      format!("{base_flags} {snapshot_flags} {lazy_flags}")
+    }
+    (true, false, true) => format!(
+      "{base_flags} {snapshot_flags} {lazy_flags} {import_assertions_flag}"
+    ),
+    (false, true, false) => format!("{base_flags} {expose_natives_flags}"),
+    (false, true, true) => {
+      format!("{base_flags} {expose_natives_flags} {import_assertions_flag}")
+    }
+    (true, true, false) => {
       format!(
         "{base_flags} {snapshot_flags} {lazy_flags} {expose_natives_flags}"
+      )
+    }
+    (true, true, true) => {
+      format!(
+        "{base_flags} {snapshot_flags} {lazy_flags} {expose_natives_flags} {import_assertions_flag}"
       )
     }
   };
@@ -59,14 +81,13 @@ fn v8_init(
   });
   v8::V8::initialize_platform(v8_platform.clone());
   v8::V8::initialize();
-
-  v8::cppgc::initalize_process(v8_platform);
 }
 
 pub fn init_v8(
   v8_platform: Option<v8::SharedRef<v8::Platform>>,
   snapshot: bool,
   expose_natives: bool,
+  import_assertions_enabled: bool,
 ) {
   static DENO_INIT: Once = Once::new();
   static DENO_SNAPSHOT: AtomicBool = AtomicBool::new(false);
@@ -74,61 +95,47 @@ pub fn init_v8(
 
   if DENO_SNAPSHOT_SET.load(Ordering::SeqCst) {
     let current = DENO_SNAPSHOT.load(Ordering::SeqCst);
-    assert_eq!(current, snapshot, "V8 may only be initialized once in either snapshotting or non-snapshotting mode. Either snapshotting or non-snapshotting mode may be used in a single process, not both.");
+    assert_eq!(
+      current, snapshot,
+      "V8 may only be initialized once in either snapshotting or non-snapshotting mode. Either snapshotting or non-snapshotting mode may be used in a single process, not both."
+    );
     DENO_SNAPSHOT_SET.store(true, Ordering::SeqCst);
     DENO_SNAPSHOT.store(snapshot, Ordering::SeqCst);
   }
 
-  DENO_INIT.call_once(move || v8_init(v8_platform, snapshot, expose_natives));
-}
-
-pub fn init_cppgc(isolate: &mut v8::Isolate) -> v8::UniqueRef<v8::cppgc::Heap> {
-  let heap = v8::cppgc::Heap::create(
-    v8::V8::get_current_platform(),
-    v8::cppgc::HeapCreateParams::new(v8::cppgc::WrapperDescriptor::new(
-      0,
-      1,
-      crate::cppgc::DEFAULT_CPP_GC_EMBEDDER_ID,
-    )),
-  );
-
-  isolate.attach_cpp_heap(&heap);
-  heap
-}
-
-pub fn create_isolate_ptr() -> *mut v8::OwnedIsolate {
-  let align = std::mem::align_of::<usize>();
-  let layout = std::alloc::Layout::from_size_align(
-    std::mem::size_of::<*mut v8::OwnedIsolate>(),
-    align,
-  )
-  .unwrap();
-  assert!(layout.size() > 0);
-  let isolate_ptr: *mut v8::OwnedIsolate =
-    // SAFETY: we just asserted that layout has non-0 size.
-    unsafe { std::alloc::alloc(layout) as *mut _ };
-  isolate_ptr
+  DENO_INIT.call_once(move || {
+    v8_init(
+      v8_platform,
+      snapshot,
+      expose_natives,
+      import_assertions_enabled,
+    )
+  });
 }
 
 pub fn create_isolate(
   will_snapshot: bool,
   maybe_create_params: Option<v8::CreateParams>,
   maybe_startup_snapshot: Option<V8Snapshot>,
-  external_refs: &'static v8::ExternalReferences,
+  external_refs: Cow<'static, [v8::ExternalReference]>,
 ) -> v8::OwnedIsolate {
+  let mut params = maybe_create_params
+    .unwrap_or_default()
+    .embedder_wrapper_type_info_offsets(
+      V8_WRAPPER_TYPE_INDEX,
+      V8_WRAPPER_OBJECT_INDEX,
+    );
   let mut isolate = if will_snapshot {
-    snapshot::create_snapshot_creator(external_refs, maybe_startup_snapshot)
+    snapshot::create_snapshot_creator(
+      external_refs,
+      maybe_startup_snapshot,
+      params,
+    )
   } else {
-    let mut params = maybe_create_params
-      .unwrap_or_default()
-      .embedder_wrapper_type_info_offsets(
-        V8_WRAPPER_TYPE_INDEX,
-        V8_WRAPPER_OBJECT_INDEX,
-      )
-      .external_references(&**external_refs);
+    params = params.external_references(external_refs);
     let has_snapshot = maybe_startup_snapshot.is_some();
     if let Some(snapshot) = maybe_startup_snapshot {
-      params = params.snapshot_blob(snapshot.0);
+      params = params.snapshot_blob(v8::StartupData::from(snapshot.0));
     }
     static FIRST_SNAPSHOT_INIT: AtomicBool = AtomicBool::new(false);
     static SNAPSHOW_INIT_MUT: Mutex<()> = Mutex::new(());
@@ -151,6 +158,9 @@ pub fn create_isolate(
 
   isolate.set_capture_stack_trace_for_uncaught_exceptions(true, 10);
   isolate.set_promise_reject_callback(bindings::promise_reject_callback);
+  isolate.set_prepare_stack_trace_callback(
+    crate::error::prepare_stack_trace_callback,
+  );
   isolate.set_host_initialize_import_meta_object_callback(
     bindings::host_initialize_import_meta_object_callback,
   );

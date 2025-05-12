@@ -1,21 +1,16 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
-
-use anyhow::bail;
-use anyhow::Context;
-use anyhow::Error;
 
 use deno_ast::MediaType;
 use deno_ast::ParseParams;
 use deno_ast::SourceMapOption;
-use deno_ast::SourceTextInfo;
-use deno_core::error::AnyError;
-use deno_core::resolve_import;
-use deno_core::url::Url;
 use deno_core::ModuleCodeBytes;
 use deno_core::ModuleCodeString;
 use deno_core::ModuleLoadResponse;
@@ -28,37 +23,39 @@ use deno_core::ModuleType;
 use deno_core::RequestedModuleType;
 use deno_core::ResolutionKind;
 use deno_core::SourceMapData;
-use deno_core::SourceMapGetter;
+use deno_core::error::ModuleLoaderError;
+use deno_core::resolve_import;
+use deno_core::url::Url;
+use deno_error::JsErrorBox;
 
-#[derive(Clone, Default)]
-struct SourceMapStore(Rc<RefCell<HashMap<String, Vec<u8>>>>);
+// TODO(bartlomieju): this is duplicated in `core/examples/ts_modules_loader.rs`.
+type SourceMapStore = Rc<RefCell<HashMap<String, Vec<u8>>>>;
 
-impl SourceMapGetter for TypescriptModuleLoader {
-  fn get_source_map(&self, specifier: &str) -> Option<Vec<u8>> {
-    self.source_maps.0.borrow().get(specifier).cloned()
-  }
-
-  fn get_source_line(
-    &self,
-    _file_name: &str,
-    _line_number: usize,
-  ) -> Option<String> {
-    None
-  }
-}
-
+// TODO(bartlomieju): this is duplicated in `core/examples/ts_modules_loader.rs`.
 #[derive(Default)]
 pub struct TypescriptModuleLoader {
   source_maps: SourceMapStore,
 }
 
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+#[class(inherit)]
+#[error("Trying to load {path:?} for {module_specifier}")]
+struct AttemptedLoadError {
+  path: PathBuf,
+  module_specifier: ModuleSpecifier,
+  #[source]
+  #[inherit]
+  source: std::io::Error,
+}
+
+// TODO(bartlomieju): this is duplicated in `core/examples/ts_modules_loader.rs`.
 impl ModuleLoader for TypescriptModuleLoader {
   fn resolve(
     &self,
     specifier: &str,
     referrer: &str,
     _kind: ResolutionKind,
-  ) -> Result<ModuleSpecifier, Error> {
+  ) -> Result<ModuleSpecifier, ModuleLoaderError> {
     Ok(resolve_import(specifier, referrer)?)
   }
 
@@ -74,14 +71,18 @@ impl ModuleLoader for TypescriptModuleLoader {
       source_maps: SourceMapStore,
       module_specifier: &ModuleSpecifier,
       requested_module_type: RequestedModuleType,
-    ) -> Result<ModuleSource, AnyError> {
+    ) -> Result<ModuleSource, ModuleLoaderError> {
       let root = Path::new(env!("CARGO_MANIFEST_DIR"));
       let start = if module_specifier.scheme() == "test" {
         1
       } else {
         0
       };
-      let path = root.join(Path::new(&module_specifier.path()[start..]));
+      let path = if module_specifier.scheme() == "file" {
+        module_specifier.to_file_path().unwrap()
+      } else {
+        root.join(Path::new(&module_specifier.path()[start..]))
+      };
       if let RequestedModuleType::Other(type_) = requested_module_type {
         let bytes = fs::read(path)?;
         return Ok(ModuleSource::new(
@@ -106,48 +107,71 @@ impl ModuleLoader for TypescriptModuleLoader {
         | MediaType::Dcts
         | MediaType::Tsx => (ModuleType::JavaScript, true),
         MediaType::Json => (ModuleType::Json, false),
+        MediaType::Wasm => (ModuleType::Wasm, false),
         _ => {
           if path.extension().unwrap_or_default() == "nocompile" {
             (ModuleType::JavaScript, false)
           } else {
-            bail!("Unknown extension {:?}", path.extension());
+            return Err(
+              JsErrorBox::generic(format!(
+                "Unknown extension {:?}",
+                path.extension()
+              ))
+              .into(),
+            );
           }
         }
       };
-      let code = std::fs::read_to_string(&path).with_context(|| {
-        format!("Trying to load {path:?} for {module_specifier}")
-      })?;
       let code = if should_transpile {
+        let code = std::fs::read_to_string(&path).map_err(|source| {
+          JsErrorBox::from_err(AttemptedLoadError {
+            path,
+            module_specifier: module_specifier.clone(),
+            source,
+          })
+        })?;
         let parsed = deno_ast::parse_module(ParseParams {
           specifier: module_specifier.clone(),
-          text_info: SourceTextInfo::from_string(code),
+          text: code.into(),
           media_type,
           capture_tokens: false,
           scope_analysis: false,
           maybe_syntax: None,
-        })?;
-        let res = parsed.transpile(&deno_ast::EmitOptions {
-          imports_not_used_as_values: deno_ast::ImportsNotUsedAsValues::Remove,
-          source_map: SourceMapOption::Separate,
-          inline_sources: false,
-          use_decorators_proposal: true,
-          ..Default::default()
-        })?;
-        let source_map = res.source_map.unwrap();
+        })
+        .map_err(JsErrorBox::from_err)?;
+        let res = parsed
+          .transpile(
+            &deno_ast::TranspileOptions {
+              imports_not_used_as_values:
+                deno_ast::ImportsNotUsedAsValues::Remove,
+              use_decorators_proposal: true,
+              ..Default::default()
+            },
+            &deno_ast::TranspileModuleOptions { module_kind: None },
+            &deno_ast::EmitOptions {
+              source_map: SourceMapOption::Separate,
+              inline_sources: false,
+              ..Default::default()
+            },
+          )
+          .map_err(JsErrorBox::from_err)?;
+        let res = res.into_source();
+        let source_map = res.source_map.unwrap().into_bytes();
         source_maps
-          .0
           .borrow_mut()
-          .insert(module_specifier.to_string(), source_map.into_bytes());
-        res.text
+          .insert(module_specifier.to_string(), source_map);
+        ModuleSourceCode::String(res.text.into())
       } else {
-        code
+        let code = std::fs::read(&path).map_err(|source| {
+          JsErrorBox::from_err(AttemptedLoadError {
+            path,
+            module_specifier: module_specifier.clone(),
+            source,
+          })
+        })?;
+        ModuleSourceCode::Bytes(code.into_boxed_slice().into())
       };
-      Ok(ModuleSource::new(
-        module_type,
-        ModuleSourceCode::String(code.into()),
-        module_specifier,
-        None,
-      ))
+      Ok(ModuleSource::new(module_type, code, module_specifier, None))
     }
 
     ModuleLoadResponse::Sync(load(
@@ -156,12 +180,20 @@ impl ModuleLoader for TypescriptModuleLoader {
       requested_module_type,
     ))
   }
+
+  fn get_source_map(&self, specifier: &str) -> Option<Cow<[u8]>> {
+    self
+      .source_maps
+      .borrow()
+      .get(specifier)
+      .map(|v| v.clone().into())
+  }
 }
 
 pub fn maybe_transpile_source(
   specifier: ModuleName,
   source: ModuleCodeString,
-) -> Result<(ModuleCodeString, Option<SourceMapData>), AnyError> {
+) -> Result<(ModuleCodeString, Option<SourceMapData>), JsErrorBox> {
   // Always transpile `checkin:` built-in modules, since they might be TypeScript.
   let media_type = if specifier.starts_with("checkin:") {
     MediaType::TypeScript
@@ -181,19 +213,29 @@ pub fn maybe_transpile_source(
 
   let parsed = deno_ast::parse_module(ParseParams {
     specifier: Url::parse(&specifier).unwrap(),
-    text_info: SourceTextInfo::from_string(source.as_str().to_owned()),
+    text: source.as_str().into(),
     media_type,
     capture_tokens: false,
     scope_analysis: false,
     maybe_syntax: None,
-  })?;
-  let transpiled_source = parsed.transpile(&deno_ast::EmitOptions {
-    imports_not_used_as_values: deno_ast::ImportsNotUsedAsValues::Remove,
-    source_map: SourceMapOption::Separate,
-    inline_sources: false,
-    use_decorators_proposal: true,
-    ..Default::default()
-  })?;
+  })
+  .map_err(JsErrorBox::from_err)?;
+  let transpiled_source = parsed
+    .transpile(
+      &deno_ast::TranspileOptions {
+        imports_not_used_as_values: deno_ast::ImportsNotUsedAsValues::Remove,
+        use_decorators_proposal: true,
+        ..Default::default()
+      },
+      &deno_ast::TranspileModuleOptions { module_kind: None },
+      &deno_ast::EmitOptions {
+        source_map: SourceMapOption::Separate,
+        inline_sources: false,
+        ..Default::default()
+      },
+    )
+    .map_err(JsErrorBox::from_err)?
+    .into_source();
 
   Ok((
     transpiled_source.text.into(),

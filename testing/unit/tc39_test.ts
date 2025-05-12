@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { assert, fail, test } from "checkin:testing";
 
 // Verify that "array by copy" proposal is enabled (https://github.com/tc39/proposal-change-array-by-copy)
@@ -15,7 +15,6 @@ test(function testArrayByCopy() {
 
 // Verify that "Array.fromAsync" proposal is enabled (https://github.com/tc39/proposal-array-from-async)
 test(async function testArrayFromAsync() {
-  // @ts-expect-error: Not available in TypeScript yet
   const b = await Array.fromAsync(new Map([[1, 2], [3, 4]]));
   if (b[0][0] !== 1 || b[0][1] !== 2 || b[1][0] !== 3 || b[1][1] !== 4) {
     fail("failed");
@@ -41,7 +40,6 @@ test(function testIteratorHelpers() {
 
 // Verify that "Set methods" proposal is enabled (https://github.com/tc39/proposal-set-methods)
 test(function testSetMethods() {
-  // @ts-expect-error: Not available in TypeScript yet
   const a: Set<number> = new Set([1, 2, 3]).intersection(new Set([3, 4, 5]));
   if (a.size !== 1 && !a.has(3)) {
     fail("failed");

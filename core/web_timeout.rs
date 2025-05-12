@@ -1,28 +1,32 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
 use cooked_waker::IntoWaker;
 use cooked_waker::ViaRawPointer;
 use cooked_waker::Wake;
 use cooked_waker::WakeRef;
-use futures::Future;
 use std::cell::Cell;
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::UnsafeCell;
-use std::collections::btree_set;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::btree_set;
+use std::future::Future;
 use std::mem::MaybeUninit;
 use std::num::NonZeroU64;
 use std::pin::Pin;
-use std::task::ready;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use std::task::ready;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::Sleep;
 
 pub(crate) type WebTimerId = u64;
+
+/// The minimum number of tombstones required to trigger compaction
+const COMPACTION_MINIMUM: usize = 16;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum TimerType {
@@ -31,7 +35,7 @@ enum TimerType {
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct TimerKey(Instant, u64, TimerType);
+struct TimerKey(Instant, u64, TimerType, bool);
 
 struct TimerData<T> {
   data: T,
@@ -106,7 +110,7 @@ pub(crate) struct WebTimersIterator<'a, T> {
 
 impl<'a, T> IntoIterator for &'a WebTimersIterator<'a, T> {
   type IntoIter = WebTimersIteratorImpl<'a, T>;
-  type Item = (u64, bool);
+  type Item = (u64, bool, bool);
 
   fn into_iter(self) -> Self::IntoIter {
     WebTimersIteratorImpl {
@@ -121,13 +125,13 @@ pub(crate) struct WebTimersIteratorImpl<'a, T> {
   timers: btree_set::Iter<'a, TimerKey>,
 }
 
-impl<'a, T> Iterator for WebTimersIteratorImpl<'a, T> {
-  type Item = (u64, bool);
+impl<T> Iterator for WebTimersIteratorImpl<'_, T> {
+  type Item = (u64, bool, bool);
   fn next(&mut self) -> Option<Self::Item> {
     loop {
       let item = self.timers.next()?;
       if self.data.contains_key(&item.1) {
-        return Some((item.1, !matches!(item.2, TimerType::Once)));
+        return Some((item.1, !matches!(item.2, TimerType::Once), item.3));
       }
     }
   }
@@ -287,12 +291,21 @@ impl<T: Clone> WebTimers<T> {
 
   /// Queues a timer to be fired in order with the other timers in this set of timers.
   pub fn queue_timer(&self, timeout_ms: u64, data: T) -> WebTimerId {
-    self.queue_timer_internal(false, timeout_ms, data)
+    self.queue_timer_internal(false, timeout_ms, data, false)
   }
 
   /// Queues a timer to be fired in order with the other timers in this set of timers.
   pub fn queue_timer_repeat(&self, timeout_ms: u64, data: T) -> WebTimerId {
-    self.queue_timer_internal(true, timeout_ms, data)
+    self.queue_timer_internal(true, timeout_ms, data, false)
+  }
+
+  pub fn queue_system_timer(
+    &self,
+    repeat: bool,
+    timeout_ms: u64,
+    data: T,
+  ) -> WebTimerId {
+    self.queue_timer_internal(repeat, timeout_ms, data, true)
   }
 
   fn queue_timer_internal(
@@ -300,6 +313,7 @@ impl<T: Clone> WebTimers<T> {
     repeat: bool,
     timeout_ms: u64,
     data: T,
+    is_system_timer: bool,
   ) -> WebTimerId {
     #[allow(clippy::let_unit_value)]
     let high_res = self.high_res_timer_lock.maybe_lock(timeout_ms);
@@ -311,12 +325,15 @@ impl<T: Clone> WebTimers<T> {
     let deadline = Instant::now()
       .checked_add(Duration::from_millis(timeout_ms))
       .unwrap();
-    if let Some(TimerKey(k, ..)) = timers.first() {
-      if &deadline < k {
+    match timers.first() {
+      Some(TimerKey(k, ..)) => {
+        if &deadline < k {
+          self.sleep.change(deadline);
+        }
+      }
+      _ => {
         self.sleep.change(deadline);
       }
-    } else {
-      self.sleep.change(deadline);
     }
 
     let timer_type = if repeat {
@@ -326,7 +343,7 @@ impl<T: Clone> WebTimers<T> {
     } else {
       TimerType::Once
     };
-    timers.insert(TimerKey(deadline, id, timer_type));
+    timers.insert(TimerKey(deadline, id, timer_type, is_system_timer));
 
     let mut data_map = self.data_map.borrow_mut();
     data_map.insert(
@@ -344,31 +361,31 @@ impl<T: Clone> WebTimers<T> {
   /// with the given ID was found.
   pub fn cancel_timer(&self, timer: u64) -> Option<T> {
     let mut data_map = self.data_map.borrow_mut();
-    if let Some(TimerData {
-      data,
-      unrefd,
-      high_res,
-    }) = data_map.remove(&timer)
-    {
-      if data_map.is_empty() {
-        // When the # of running timers hits zero, clear the timer tree.
-        // When debug assertions are enabled, we do a consistency check.
-        debug_assert_eq!(self.unrefd_count.get(), if unrefd { 1 } else { 0 });
-        #[cfg(any(windows, test))]
-        debug_assert_eq!(self.high_res_timer_lock.is_locked(), high_res);
-        self.high_res_timer_lock.clear();
-        self.unrefd_count.set(0);
-        self.timers.borrow_mut().clear();
-        self.sleep.clear();
-      } else {
-        self.high_res_timer_lock.maybe_unlock(high_res);
-        if unrefd {
-          self.unrefd_count.set(self.unrefd_count.get() - 1);
+    match data_map.remove(&timer) {
+      Some(TimerData {
+        data,
+        unrefd,
+        high_res,
+      }) => {
+        if data_map.is_empty() {
+          // When the # of running timers hits zero, clear the timer tree.
+          // When debug assertions are enabled, we do a consistency check.
+          debug_assert_eq!(self.unrefd_count.get(), if unrefd { 1 } else { 0 });
+          #[cfg(any(windows, test))]
+          debug_assert_eq!(self.high_res_timer_lock.is_locked(), high_res);
+          self.high_res_timer_lock.clear();
+          self.unrefd_count.set(0);
+          self.timers.borrow_mut().clear();
+          self.sleep.clear();
+        } else {
+          self.high_res_timer_lock.maybe_unlock(high_res);
+          if unrefd {
+            self.unrefd_count.set(self.unrefd_count.get() - 1);
+          }
         }
+        Some(data)
       }
-      Some(data)
-    } else {
-      None
+      _ => None,
     }
   }
 
@@ -380,9 +397,9 @@ impl<T: Clone> WebTimers<T> {
     let mut data = self.data_map.borrow_mut();
     let mut output = vec![];
 
-    let mut split = timers.split_off(&TimerKey(now, 0, TimerType::Once));
+    let mut split = timers.split_off(&TimerKey(now, 0, TimerType::Once, false));
     std::mem::swap(&mut split, &mut timers);
-    for TimerKey(_, id, timer_type) in split {
+    for TimerKey(_, id, timer_type, is_system_timer) in split {
       if let TimerType::Repeat(interval) = timer_type {
         if let Some(TimerData { data, .. }) = data.get(&id) {
           output.push((id, data.clone()));
@@ -392,6 +409,7 @@ impl<T: Clone> WebTimers<T> {
               .unwrap(),
             id,
             timer_type,
+            is_system_timer,
           ));
         }
       } else if let Some(TimerData {
@@ -413,7 +431,7 @@ impl<T: Clone> WebTimers<T> {
       // We should never have an ineffective poll when the data map is empty, as we check
       // for this in cancel_timer.
       debug_assert!(!data.is_empty());
-      while let Some(TimerKey(_, id, _)) = timers.first() {
+      while let Some(TimerKey(_, id, ..)) = timers.first() {
         if data.contains_key(id) {
           break;
         } else {
@@ -433,11 +451,9 @@ impl<T: Clone> WebTimers<T> {
         self.sleep.clear();
       }
     } else {
-      // If we have more tombstones than data, and tombstones are >
-      // COMPACTION_MINIMUM, run a compaction.
-      const COMPACTION_MINIMUM: usize = 16;
+      // Run compaction when there are enough tombstones to justify cleanup.
       let tombstone_count = timers.len() - data.len();
-      if tombstone_count > data.len() && tombstone_count > COMPACTION_MINIMUM {
+      if tombstone_count > COMPACTION_MINIMUM {
         timers.retain(|k| data.contains_key(&k.1));
       }
       if let Some(TimerKey(k, ..)) = timers.first() {
@@ -484,7 +500,7 @@ impl<T: Clone> WebTimers<T> {
 
 #[cfg(windows)]
 #[link(name = "winmm")]
-extern "C" {
+unsafe extern "C" {
   fn timeBeginPeriod(n: u32);
   fn timeEndPeriod(n: u32);
 }
@@ -578,8 +594,8 @@ impl HighResTimerLock {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use futures::future::poll_fn;
   use rstest::rstest;
+  use std::future::poll_fn;
 
   /// Miri is way too slow here on some of the larger tests.
   const TEN_THOUSAND: u64 = if cfg!(miri) { 100 } else { 10_000 };
@@ -617,6 +633,66 @@ mod tests {
     }
     assert_eq!(v.len(), len);
     v
+  }
+
+  /// This test attempts to mimic a memory leak fix in the timer compaction logic.
+  /// See https://github.com/denoland/deno/issues/27925
+  ///
+  /// The leak happens when there are enough tombstones to justify cleanup
+  /// (tombstone_count > COMPACTION_MINIMUM) but there are also more active timers
+  /// than tombstones (tombstone_count <= data.len()). In this scenario, the original
+  /// condition won't trigger compaction, allowing tombstones to accumulate.
+  #[test]
+  fn test_timer_tombstone_memory_leak() {
+    const ACTIVE_TIMERS: usize = 100;
+    const TOMBSTONES: usize = 30; // > COMPACTION_MINIMUM but < ACTIVE_TIMERS
+    const CLEANUP_THRESHOLD: usize = 5; // Threshold to determine if compaction happened
+    async_test(async {
+      let timers = WebTimers::<()>::default();
+
+      // Create mostly long-lived timers, with a few immediate ones
+      // The immediate timers ensure poll_timers returns non-empty output
+      // which prevents the front-compaction mechanism from cleaning up tombstones
+      let mut active_timer_ids = Vec::with_capacity(ACTIVE_TIMERS);
+      for i in 0..ACTIVE_TIMERS {
+        let timeout = if i < CLEANUP_THRESHOLD { 1 } else { 10000 };
+        active_timer_ids.push(timers.queue_timer(timeout, ()));
+      }
+
+      // Create and immediately cancel timers to generate tombstones
+      for _ in 0..TOMBSTONES {
+        let id = timers.queue_timer(10000, ());
+        timers.cancel_timer(id);
+      }
+
+      let count_tombstones =
+        || timers.timers.borrow().len() - timers.data_map.borrow().len();
+      let initial_tombstones = count_tombstones();
+
+      // Verify test setup is correct
+      assert!(
+        initial_tombstones > COMPACTION_MINIMUM,
+        "Test requires tombstones > COMPACTION_MINIMUM"
+      );
+      assert!(
+        initial_tombstones <= ACTIVE_TIMERS,
+        "Test requires tombstones <= active_timers"
+      );
+
+      // Poll timers to trigger potential compaction
+      let _ = poll_fn(|cx| timers.poll_timers(cx)).await;
+
+      let remaining_tombstones = count_tombstones();
+
+      for id in active_timer_ids {
+        timers.cancel_timer(id);
+      }
+
+      assert!(
+        remaining_tombstones < CLEANUP_THRESHOLD,
+        "Memory leak: Tombstones not cleaned up"
+      );
+    });
   }
 
   #[test]

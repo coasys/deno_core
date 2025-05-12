@@ -1,12 +1,10 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
+use crate::FastStaticString;
+use crate::error::CoreError;
 use crate::error::exception_to_err_result;
-use crate::error::AnyError;
 use crate::fast_string::FastString;
 use crate::module_specifier::ModuleSpecifier;
-use crate::FastStaticString;
-use anyhow::bail;
-use anyhow::Context;
-use anyhow::Error;
 use serde::Deserialize;
 use serde::Serialize;
 use std::borrow::Cow;
@@ -23,16 +21,18 @@ mod recursive_load;
 #[cfg(all(test, not(miri)))]
 mod tests;
 
+pub use loaders::ExtCodeCache;
 pub(crate) use loaders::ExtModuleLoader;
-pub use loaders::ExtModuleLoaderCb;
 pub use loaders::FsModuleLoader;
 pub(crate) use loaders::LazyEsmModuleLoader;
 pub use loaders::ModuleLoadResponse;
 pub use loaders::ModuleLoader;
+pub use loaders::ModuleLoaderError;
 pub use loaders::NoopModuleLoader;
 pub use loaders::StaticModuleLoader;
-pub(crate) use map::synthetic_module_evaluation_steps;
 pub(crate) use map::ModuleMap;
+pub(crate) use map::script_origin;
+pub(crate) use map::synthetic_module_evaluation_steps;
 pub(crate) use module_map_data::ModuleMapSnapshotData;
 
 pub type ModuleId = usize;
@@ -41,10 +41,19 @@ pub(crate) type ModuleLoadId = i32;
 /// The actual source code returned from the loader. Most embedders should
 /// try to return bytes and let deno_core interpret if the module should be
 /// converted to a string or not.
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub enum ModuleSourceCode {
   String(ModuleCodeString),
   Bytes(ModuleCodeBytes),
+}
+
+impl ModuleSourceCode {
+  pub fn as_bytes(&self) -> &[u8] {
+    match self {
+      Self::String(s) => s.as_bytes(),
+      Self::Bytes(b) => b.as_bytes(),
+    }
+  }
 }
 
 pub type ModuleCodeString = FastString;
@@ -120,7 +129,7 @@ impl IntoModuleCodeString for Arc<str> {
   }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 pub enum ModuleCodeBytes {
   /// Created from static data.
   Static(&'static [u8]),
@@ -171,16 +180,20 @@ impl From<&'static [u8]> for ModuleCodeBytes {
 
 /// Callback to customize value of `import.meta.resolve("./foo.ts")`.
 pub type ImportMetaResolveCallback = Box<
-  dyn Fn(&dyn ModuleLoader, String, String) -> Result<ModuleSpecifier, Error>,
+  dyn Fn(
+    &dyn ModuleLoader,
+    String,
+    String,
+  ) -> Result<ModuleSpecifier, ModuleLoaderError>,
 >;
 
 pub(crate) fn default_import_meta_resolve_cb(
   loader: &dyn ModuleLoader,
   specifier: String,
   referrer: String,
-) -> Result<ModuleSpecifier, Error> {
+) -> Result<ModuleSpecifier, ModuleLoaderError> {
   if specifier.starts_with("npm:") {
-    bail!("\"npm:\" specifiers are currently not supported in import.meta.resolve()");
+    return Err(ModuleLoaderError::NpmUnsupportedMetaResolve);
   }
 
   loader.resolve(&specifier, &referrer, ResolutionKind::DynamicImport)
@@ -199,13 +212,17 @@ pub type CustomModuleEvaluationCb = Box<
     Cow<'_, str>,
     &FastString,
     ModuleSourceCode,
-  ) -> Result<CustomModuleEvaluationKind, AnyError>,
+  ) -> Result<CustomModuleEvaluationKind, deno_error::JsErrorBox>,
 >;
 
 /// A callback to get the code cache for a script.
 /// (specifier, code) -> ...
-pub type EvalContextGetCodeCacheCb =
-  Box<dyn Fn(&Url, &v8::String) -> Result<SourceCodeCacheInfo, AnyError>>;
+pub type EvalContextGetCodeCacheCb = Box<
+  dyn Fn(
+    &Url,
+    &v8::String,
+  ) -> Result<SourceCodeCacheInfo, deno_error::JsErrorBox>,
+>;
 
 /// Callback when the code cache is ready.
 /// (specifier, hash, data) -> ()
@@ -450,23 +467,21 @@ impl ModuleSource {
     }
   }
 
-  pub fn get_string_source(
-    specifier: &str,
-    code: ModuleSourceCode,
-  ) -> Result<ModuleCodeString, AnyError> {
+  pub fn get_string_source(code: ModuleSourceCode) -> ModuleCodeString {
     match code {
-      ModuleSourceCode::String(code) => Ok(code),
+      ModuleSourceCode::String(code) => code,
       ModuleSourceCode::Bytes(bytes) => {
-        let str_ = String::from_utf8(bytes.to_vec()).with_context(|| {
-          format!("Can't convert source code to string for {}", specifier)
-        })?;
-        Ok(ModuleCodeString::from(str_))
+        match String::from_utf8_lossy(bytes.as_bytes()) {
+          Cow::Borrowed(s) => ModuleCodeString::from(s.to_owned()),
+          Cow::Owned(s) => ModuleCodeString::from(s),
+        }
       }
     }
   }
 }
 
-pub type ModuleSourceFuture = dyn Future<Output = Result<ModuleSource, Error>>;
+pub type ModuleSourceFuture =
+  dyn Future<Output = Result<ModuleSource, ModuleLoaderError>>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ResolutionKind {
@@ -613,26 +628,57 @@ pub(crate) struct ModuleInfo {
   pub module_type: ModuleType,
 }
 
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+#[class(generic)]
+pub enum ModuleConcreteError {
+  #[error(
+    "Trying to create \"main\" module ({new_module:?}), when one already exists ({main_module:?})"
+  )]
+  MainModuleAlreadyExists {
+    main_module: String,
+    new_module: String,
+  },
+  #[error("Unable to get code cache from unbound module script")]
+  UnboundModuleScriptCodeCache,
+  #[class(inherit)]
+  #[error("{0}")]
+  WasmParse(wasm_dep_analyzer::ParseError),
+  #[error("Source code for Wasm module must be provided as bytes")]
+  WasmNotBytes,
+  #[error("Failed to compile Wasm module '{0}'")]
+  WasmCompile(String),
+  #[error("Importing '{0}' modules is not supported")]
+  UnsupportedKind(String),
+}
+
 #[derive(Debug)]
-pub(crate) enum ModuleError {
+pub enum ModuleError {
   Exception(v8::Global<v8::Value>),
-  Other(Error),
+  Concrete(ModuleConcreteError),
+  Core(CoreError),
 }
 
 impl ModuleError {
-  pub fn into_any_error(
+  pub fn into_error(
     self,
     scope: &mut v8::HandleScope,
     in_promise: bool,
     clear_error: bool,
-  ) -> AnyError {
+  ) -> CoreError {
     match self {
       ModuleError::Exception(exception) => {
         let exception = v8::Local::new(scope, exception);
         exception_to_err_result::<()>(scope, exception, in_promise, clear_error)
           .unwrap_err()
       }
-      ModuleError::Other(error) => error,
+      ModuleError::Core(error) => error,
+      ModuleError::Concrete(error) => CoreError::Module(error),
     }
+  }
+}
+
+impl From<ModuleConcreteError> for ModuleError {
+  fn from(value: ModuleConcreteError) -> Self {
+    ModuleError::Concrete(value)
   }
 }

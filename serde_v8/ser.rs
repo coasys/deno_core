@@ -1,17 +1,11 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
 use serde::ser;
 use serde::ser::Serialize;
 
 use std::cell::RefCell;
 use std::ops::DerefMut;
 
-use crate::error::Error;
-use crate::error::Result;
-use crate::keys::v8_struct_key;
-use crate::magic;
-use crate::magic::transl8::MagicType;
-use crate::magic::transl8::ToV8;
-use crate::magic::transl8::MAGIC_FIELD;
 use crate::AnyValue;
 use crate::BigInt;
 use crate::ByteString;
@@ -19,6 +13,13 @@ use crate::DetachedBuffer;
 use crate::ExternalPointer;
 use crate::ToJsBuffer;
 use crate::U16String;
+use crate::error::Error;
+use crate::error::Result;
+use crate::keys::v8_struct_key;
+use crate::magic;
+use crate::magic::transl8::MAGIC_FIELD;
+use crate::magic::transl8::MagicType;
+use crate::magic::transl8::ToV8;
 
 type JsValue<'s> = v8::Local<'s, v8::Value>;
 type JsResult<'s> = Result<JsValue<'s>>;
@@ -67,8 +68,7 @@ impl<'a, 'b, 'c, S> VariantSerializer<'a, 'b, 'c, S> {
   }
 }
 
-impl<'a, 'b, 'c, S> ser::SerializeTupleVariant
-  for VariantSerializer<'a, 'b, 'c, S>
+impl<'a, S> ser::SerializeTupleVariant for VariantSerializer<'a, '_, '_, S>
 where
   S: ser::SerializeTupleStruct<Ok = JsValue<'a>, Error = Error>,
 {
@@ -87,8 +87,7 @@ where
   }
 }
 
-impl<'a, 'b, 'c, S> ser::SerializeStructVariant
-  for VariantSerializer<'a, 'b, 'c, S>
+impl<'a, S> ser::SerializeStructVariant for VariantSerializer<'a, '_, '_, S>
 where
   S: ser::SerializeStruct<Ok = JsValue<'a>, Error = Error>,
 {
@@ -123,7 +122,7 @@ impl<'a, 'b, 'c> ArraySerializer<'a, 'b, 'c> {
   }
 }
 
-impl<'a, 'b, 'c> ser::SerializeSeq for ArraySerializer<'a, 'b, 'c> {
+impl<'a> ser::SerializeSeq for ArraySerializer<'a, '_, '_> {
   type Ok = JsValue<'a>;
   type Error = Error;
 
@@ -144,7 +143,7 @@ impl<'a, 'b, 'c> ser::SerializeSeq for ArraySerializer<'a, 'b, 'c> {
   }
 }
 
-impl<'a, 'b, 'c> ser::SerializeTuple for ArraySerializer<'a, 'b, 'c> {
+impl<'a> ser::SerializeTuple for ArraySerializer<'a, '_, '_> {
   type Ok = JsValue<'a>;
   type Error = Error;
 
@@ -160,7 +159,7 @@ impl<'a, 'b, 'c> ser::SerializeTuple for ArraySerializer<'a, 'b, 'c> {
   }
 }
 
-impl<'a, 'b, 'c> ser::SerializeTupleStruct for ArraySerializer<'a, 'b, 'c> {
+impl<'a> ser::SerializeTupleStruct for ArraySerializer<'a, '_, '_> {
   type Ok = JsValue<'a>;
   type Error = Error;
 
@@ -194,7 +193,7 @@ impl<'a, 'b, 'c> ObjectSerializer<'a, 'b, 'c> {
   }
 }
 
-impl<'a, 'b, 'c> ser::SerializeStruct for ObjectSerializer<'a, 'b, 'c> {
+impl<'a> ser::SerializeStruct for ObjectSerializer<'a, '_, '_> {
   type Ok = JsValue<'a>;
   type Error = Error;
 
@@ -240,8 +239,8 @@ impl<'a, 'b, 'c, T> MagicalSerializer<'a, 'b, 'c, T> {
   }
 }
 
-impl<'a, 'b, 'c, T: MagicType + ToV8> ser::SerializeStruct
-  for MagicalSerializer<'a, 'b, 'c, T>
+impl<'a, T: MagicType + ToV8> ser::SerializeStruct
+  for MagicalSerializer<'a, '_, '_, T>
 {
   type Ok = JsValue<'a>;
   type Error = Error;
@@ -275,6 +274,7 @@ impl<'a, 'b, 'c, T: MagicType + ToV8> ser::SerializeStruct
 pub enum StructSerializers<'a, 'b, 'c> {
   ExternalPointer(MagicalSerializer<'a, 'b, 'c, magic::ExternalPointer>),
   Magic(MagicalSerializer<'a, 'b, 'c, magic::Value<'a>>),
+  GlobalMagic(MagicalSerializer<'a, 'b, 'c, magic::GlobalValue>),
   RustToV8Buf(MagicalSerializer<'a, 'b, 'c, ToJsBuffer>),
   MagicAnyValue(MagicalSerializer<'a, 'b, 'c, AnyValue>),
   MagicDetached(MagicalSerializer<'a, 'b, 'c, DetachedBuffer>),
@@ -284,7 +284,7 @@ pub enum StructSerializers<'a, 'b, 'c> {
   Regular(ObjectSerializer<'a, 'b, 'c>),
 }
 
-impl<'a, 'b, 'c> ser::SerializeStruct for StructSerializers<'a, 'b, 'c> {
+impl<'a> ser::SerializeStruct for StructSerializers<'a, '_, '_> {
   type Ok = JsValue<'a>;
   type Error = Error;
 
@@ -296,6 +296,7 @@ impl<'a, 'b, 'c> ser::SerializeStruct for StructSerializers<'a, 'b, 'c> {
     match self {
       StructSerializers::ExternalPointer(s) => s.serialize_field(key, value),
       StructSerializers::Magic(s) => s.serialize_field(key, value),
+      StructSerializers::GlobalMagic(s) => s.serialize_field(key, value),
       StructSerializers::RustToV8Buf(s) => s.serialize_field(key, value),
       StructSerializers::MagicAnyValue(s) => s.serialize_field(key, value),
       StructSerializers::MagicDetached(s) => s.serialize_field(key, value),
@@ -310,6 +311,7 @@ impl<'a, 'b, 'c> ser::SerializeStruct for StructSerializers<'a, 'b, 'c> {
     match self {
       StructSerializers::ExternalPointer(s) => s.end(),
       StructSerializers::Magic(s) => s.end(),
+      StructSerializers::GlobalMagic(s) => s.end(),
       StructSerializers::RustToV8Buf(s) => s.end(),
       StructSerializers::MagicAnyValue(s) => s.end(),
       StructSerializers::MagicDetached(s) => s.end(),
@@ -340,7 +342,7 @@ impl<'a, 'b, 'c> MapSerializer<'a, 'b, 'c> {
   }
 }
 
-impl<'a, 'b, 'c> ser::SerializeMap for MapSerializer<'a, 'b, 'c> {
+impl<'a> ser::SerializeMap for MapSerializer<'a, '_, '_> {
   type Ok = JsValue<'a>;
   type Error = Error;
 
@@ -603,6 +605,10 @@ impl<'a, 'b, 'c> ser::Serializer for Serializer<'a, 'b, 'c> {
       magic::Value::MAGIC_NAME => {
         let m = MagicalSerializer::<magic::Value<'a>>::new(self.scope);
         Ok(StructSerializers::Magic(m))
+      }
+      magic::GlobalValue::MAGIC_NAME => {
+        let m = MagicalSerializer::<magic::GlobalValue>::new(self.scope);
+        Ok(StructSerializers::GlobalMagic(m))
       }
       _ => {
         // Regular structs

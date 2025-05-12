@@ -1,12 +1,12 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use futures::task::AtomicWaker;
 use std::marker::PhantomData;
 use std::ops::DerefMut;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 
@@ -84,7 +84,8 @@ impl V8TaskSpawnerFactory {
 
     // SAFETY: we are removing the Send trait as we return the tasks here to prevent
     // these tasks from accidentally leaking to another thread.
-    let tasks = unsafe { std::mem::transmute(tasks) };
+    let tasks =
+      unsafe { std::mem::transmute::<Vec<SendTask>, Vec<UnsendTask>>(tasks) };
     Poll::Ready(tasks)
   }
 

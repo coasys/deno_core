@@ -1,18 +1,10 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
+use serde::Deserialize;
 use serde::de::SeqAccess as _;
 use serde::de::Visitor;
 use serde::de::{self};
-use serde::Deserialize;
 
-use crate::error::Error;
-use crate::error::Result;
-use crate::keys::v8_struct_key;
-use crate::keys::KeyCache;
-use crate::magic;
-use crate::magic::transl8::visit_magic;
-use crate::magic::transl8::FromV8;
-use crate::magic::transl8::MagicType;
-use crate::payload::ValueType;
 use crate::AnyValue;
 use crate::BigInt;
 use crate::ByteString;
@@ -20,6 +12,15 @@ use crate::DetachedBuffer;
 use crate::JsBuffer;
 use crate::StringOrBuffer;
 use crate::U16String;
+use crate::error::Error;
+use crate::error::Result;
+use crate::keys::KeyCache;
+use crate::keys::v8_struct_key;
+use crate::magic;
+use crate::magic::transl8::FromV8;
+use crate::magic::transl8::MagicType;
+use crate::magic::transl8::visit_magic;
+use crate::payload::ValueType;
 
 pub struct Deserializer<'a, 'b, 's> {
   input: v8::Local<'a, v8::Value>,
@@ -106,9 +107,7 @@ macro_rules! deserialize_unsigned {
   };
 }
 
-impl<'de, 'a, 'b, 's, 'x> de::Deserializer<'de>
-  for &'x mut Deserializer<'a, 'b, 's>
-{
+impl<'de> de::Deserializer<'de> for &'_ mut Deserializer<'_, '_, '_> {
   type Error = Error;
 
   fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
@@ -200,6 +199,7 @@ impl<'de, 'a, 'b, 's, 'x> de::Deserializer<'de>
     V: Visitor<'de>,
   {
     if self.input.is_string() || self.input.is_string_object() {
+      // fixme: this unwrap is not safe because stringifier could have thrown
       let v8_string = self.input.to_string(self.scope).unwrap();
       let string = to_utf8(v8_string, self.scope);
       visitor.visit_string(string)
@@ -265,10 +265,10 @@ impl<'de, 'a, 'b, 's, 'x> de::Deserializer<'de>
   where
     V: Visitor<'de>,
   {
-    let obj = v8::Local::<v8::Object>::try_from(self.input).unwrap();
-    if obj.is_array() {
+    let obj = v8::Local::<v8::Object>::try_from(self.input)
+      .map_err(|_| Error::ExpectedObject(self.input.type_repr()))?;
+    if let Ok(array) = v8::Local::<v8::Array>::try_from(obj) {
       // If the obj is an array fail if it's length differs from the tuple length
-      let array = v8::Local::<v8::Array>::try_from(self.input).unwrap();
       let array_len = array.length() as usize;
       if array_len != len {
         return Err(Error::LengthMismatch(array_len, len));
@@ -298,10 +298,8 @@ impl<'de, 'a, 'b, 's, 'x> de::Deserializer<'de>
     let obj = v8::Local::<v8::Object>::try_from(self.input)
       .map_err(|_| Error::ExpectedObject(self.input.type_repr()))?;
 
-    if v8::Local::<v8::Map>::try_from(self.input).is_ok() {
-      let pairs_array = v8::Local::<v8::Map>::try_from(self.input)
-        .unwrap()
-        .as_array(self.scope);
+    if let Ok(map) = v8::Local::<v8::Map>::try_from(self.input) {
+      let pairs_array = map.as_array(self.scope);
       let map = MapPairsAccess {
         pos: 0,
         len: pairs_array.length(),
@@ -342,6 +340,10 @@ impl<'de, 'a, 'b, 's, 'x> de::Deserializer<'de>
       BigInt::MAGIC_NAME => {
         visit_magic(visitor, BigInt::from_v8(self.scope, self.input)?)
       }
+      magic::GlobalValue::MAGIC_NAME => visit_magic(
+        visitor,
+        magic::GlobalValue::from_v8(self.scope, self.input)?,
+      ),
       magic::Value::MAGIC_NAME => {
         visit_magic(visitor, magic::Value::from_v8(self.scope, self.input)?)
       }
@@ -390,9 +392,7 @@ impl<'de, 'a, 'b, 's, 'x> de::Deserializer<'de>
       })
     }
     // Struct or tuple variant
-    else if self.input.is_object() {
-      // Assume object
-      let obj = v8::Local::<v8::Object>::try_from(self.input).unwrap();
+    else if let Ok(obj) = v8::Local::<v8::Object>::try_from(self.input) {
       // Unpack single-key
       let tag = {
         let prop_names =
@@ -403,9 +403,11 @@ impl<'de, 'a, 'b, 's, 'x> de::Deserializer<'de>
         if prop_names_len != 1 {
           return Err(Error::LengthMismatch(prop_names_len as usize, 1));
         }
+        // fixme: this unwrap  is not safe because of proxies
         prop_names.get_index(self.scope, 0).unwrap()
       };
 
+      // fixme: this unwrap  is not safe because of proxies
       let payload = obj.get(self.scope, tag).unwrap();
       visitor.visit_enum(EnumAccess {
         scope: self.scope,
@@ -625,6 +627,7 @@ impl<'de> de::SeqAccess<'de> for SeqAccess<'_, '_> {
     seed: T,
   ) -> Result<Option<T::Value>> {
     if let Some(pos) = self.range.next() {
+      // fixme: this unwrap  is not safe because of proxies
       let val = self.obj.get_index(self.scope, pos).unwrap();
       let mut deserializer = Deserializer::new(self.scope, val, None);
       seed.deserialize(&mut deserializer).map(Some)
@@ -671,9 +674,7 @@ struct VariantDeserializer<'a, 'b, 's> {
   scope: &'b mut v8::HandleScope<'s>,
 }
 
-impl<'de, 'a, 'b, 's> de::VariantAccess<'de>
-  for VariantDeserializer<'a, 'b, 's>
-{
+impl<'de> de::VariantAccess<'de> for VariantDeserializer<'_, '_, '_> {
   type Error = Error;
 
   fn unit_variant(self) -> Result<()> {
@@ -744,12 +745,11 @@ fn to_utf8_fast(
   let mut buf = Vec::with_capacity(capacity);
 
   let mut nchars = 0;
-  let bytes_len = s.write_utf8_uninit(
+  let bytes_len = s.write_utf8_uninit_v2(
     scope,
     buf.spare_capacity_mut(),
+    v8::WriteFlags::kReplaceInvalidUtf8,
     Some(&mut nchars),
-    v8::WriteOptions::NO_NULL_TERMINATION
-      | v8::WriteOptions::REPLACE_INVALID_UTF8,
   );
 
   if nchars < str_chars {
@@ -770,17 +770,16 @@ fn to_utf8_slow(
   let capacity = s.utf8_length(scope);
   let mut buf = Vec::with_capacity(capacity);
 
-  let bytes_len = s.write_utf8_uninit(
+  s.write_utf8_uninit_v2(
     scope,
     buf.spare_capacity_mut(),
+    v8::WriteFlags::kReplaceInvalidUtf8,
     None,
-    v8::WriteOptions::NO_NULL_TERMINATION
-      | v8::WriteOptions::REPLACE_INVALID_UTF8,
   );
 
   // SAFETY: write_utf8_uninit guarantees `bytes_len` bytes are initialized & valid utf8
   unsafe {
-    buf.set_len(bytes_len);
+    buf.set_len(capacity);
     String::from_utf8_unchecked(buf)
   }
 }

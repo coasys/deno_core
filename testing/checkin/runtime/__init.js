@@ -1,14 +1,15 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
-import "./__bootstrap.js";
+// Copyright 2018-2025 the Deno authors. MIT license.
 import * as async from "checkin:async";
 import * as console from "checkin:console";
 import * as error from "checkin:error";
 import * as timers from "checkin:timers";
 import * as worker from "checkin:worker";
 import * as throw_ from "checkin:throw";
+import * as object from "checkin:object";
 async;
 error;
 throw_;
+object;
 
 globalThis.console = console.console;
 globalThis.setTimeout = timers.setTimeout;

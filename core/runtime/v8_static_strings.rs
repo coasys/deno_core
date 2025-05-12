@@ -1,4 +1,6 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
+#[macro_export]
 macro_rules! v8_static_strings {
   ($($ident:ident = $str:literal),* $(,)?) => {
     $(
@@ -7,24 +9,34 @@ macro_rules! v8_static_strings {
   };
 }
 
+pub use v8_static_strings;
+
 v8_static_strings!(
-  DENO = "Deno",
-  CORE = "core",
-  OPS = "ops",
-  URL = "url",
-  MAIN = "main",
-  RESOLVE = "resolve",
-  MESSAGE = "message",
-  CODE = "code",
-  ERR_MODULE_NOT_FOUND = "ERR_MODULE_NOT_FOUND",
-  EVENT_LOOP_TICK = "eventLoopTick",
   BUILD_CUSTOM_ERROR = "buildCustomError",
-  CONSOLE = "console",
   CALL_CONSOLE = "callConsole",
-  FILENAME = "filename",
+  CALL_SITE_EVALS = "deno_core::call_site_evals",
+  CAUSE = "cause",
+  CODE = "code",
+  CONSOLE = "console",
+  CONSTRUCTOR = "constructor",
+  CORE = "core",
+  DENO = "Deno",
+  DEFAULT = "default",
   DIRNAME = "dirname",
+  ERR_MODULE_NOT_FOUND = "ERR_MODULE_NOT_FOUND",
+  ERRORS = "errors",
+  EVENT_LOOP_TICK = "eventLoopTick",
+  FILENAME = "filename",
+  INSTANCE = "Instance",
+  MAIN = "main",
+  MESSAGE = "message",
+  NAME = "name",
+  OPS = "ops",
+  RESOLVE = "resolve",
   SET_UP_ASYNC_STUB = "setUpAsyncStub",
+  STACK = "stack",
+  URL = "url",
+  WASM_INSTANCE = "WasmInstance",
   WEBASSEMBLY = "WebAssembly",
-  INSTANTIATE = "instantiate",
-  WASM_INSTANTIATE = "wasmInstantiate",
+  ESMODULE = "__esModule",
 );

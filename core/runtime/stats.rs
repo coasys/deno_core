@@ -1,7 +1,8 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
+use super::ContextState;
 use super::op_driver::OpDriver;
 use super::op_driver::OpInflightStats;
-use super::ContextState;
 use crate::OpId;
 use crate::OpState;
 use crate::PromiseId;
@@ -192,7 +193,14 @@ impl RuntimeActivityStatsFactory {
         timers: Vec::with_capacity(timer_count),
         repeats: BitSet::with_capacity(timer_count),
       };
-      for (timer_id, repeats) in &self.context_state.timers.iter() {
+      for (timer_id, repeats, is_system_timer) in
+        &self.context_state.timers.iter()
+      {
+        // Ignore system timer from stats
+        if is_system_timer {
+          continue;
+        }
+
         if repeats {
           timers.repeats.insert(timers.timers.len());
         }

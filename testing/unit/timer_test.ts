@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 import { assert, assertEquals, test } from "checkin:testing";
 
 test(async function testTimeout() {
@@ -89,10 +89,11 @@ test(async function testMicrotaskOrdering() {
 
 test(async function testTimerException() {
   const { promise, resolve } = Promise.withResolvers<Error>();
-  globalThis.onerror = (e: ErrorEvent) => {
+  globalThis.onerror = ((e: ErrorEvent) => {
     resolve(e.error);
     e.preventDefault();
-  };
+    // deno-lint-ignore no-explicit-any
+  }) as any;
   try {
     setTimeout(() => {
       throw new Error("timeout error");
@@ -105,7 +106,7 @@ test(async function testTimerException() {
 
 test(async function testTimerThis() {
   const { promise, resolve, reject } = Promise.withResolvers();
-  setTimeout(function () {
+  setTimeout(function (this: unknown) {
     try {
       assertEquals(this, globalThis);
       resolve(0);
